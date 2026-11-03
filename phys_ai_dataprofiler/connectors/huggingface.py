@@ -54,6 +54,7 @@ from phys_ai_dataprofiler.inspectors.rich import RichInspector
 from phys_ai_dataprofiler.remote.range_file import HfRangeFile
 from phys_ai_dataprofiler.remote.inspector import inspect_mcap_remote, inspect_mat_remote, sniff_format
 from phys_ai_dataprofiler.remote.parquet import inspect_parquet
+from phys_ai_dataprofiler.remote.rosbag import inspect_bag1_remote, inspect_bag2_remote
 from phys_ai_dataprofiler.remote.range_file import LocalRangeFile
 
 try:
@@ -69,7 +70,7 @@ except ImportError:  # pragma: no cover - reported at runtime
     HF_AVAILABLE = False
 
 
-DEFAULT_EXTENSIONS = (".mcap", ".mat", ".parquet")
+DEFAULT_EXTENSIONS = (".mcap", ".mat", ".parquet", ".bag", ".db3")
 TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 
 
@@ -89,7 +90,7 @@ class FileReport:
     repo_path: str
     local_path: str | None
     size_bytes: int | None
-    detected_format: str | None            # "mcap", "mat", "unknown"
+    detected_format: str | None            # "mcap", "mat", "parquet", "bag1", "bag2", "unknown"
     valid: bool
     mode: str = "remote"                   # "remote" or "download"
     bytes_fetched: int | None = None       # bytes actually read from the Hub
@@ -180,28 +181,15 @@ def _pct(part: int | None, whole: int | None) -> str:
 
 
 def _sniff_local_format(path: Path) -> str:
-    """Detect the container format from magic bytes, ignoring the extension."""
+    """Detect the container format from magic bytes, falling back to the extension."""
     try:
-        with path.open("rb") as f:
-            head = f.read(128)
+        rf = LocalRangeFile(path)
     except OSError:
         return "unknown"
-    if head[: len(MCAP_MAGIC)] == MCAP_MAGIC:
-        return "mcap"
-    if head[:4] == b"PAR1":
-        return "parquet"
-    if MatFileInspector._detect_format(head) is not None and head[:8] != HDF5_MAGIC:
-        return "mat"
-    if head[:8] == HDF5_MAGIC:
-        return "mat"
-    ext = path.suffix.lower()
-    if ext == ".mcap":
-        return "mcap"
-    if ext == ".mat":
-        return "mat"
-    if ext == ".parquet":
-        return "parquet"
-    return "unknown"
+    try:
+        return sniff_format(rf, path.name)
+    finally:
+        rf.close()
 
 
 def resolve_token(explicit: str | None) -> str | None:
@@ -374,6 +362,17 @@ class HuggingFaceConnector:
             revision=self.revision, block_size=block_size,
         )
 
+    def read_text(self, path: str, max_bytes: int = 4 << 20) -> str:
+        """Read a small repo file (e.g. a rosbag2 metadata.yaml) without downloading it to disk."""
+        rf = HfRangeFile(self.repo_id, path, token=self.token, repo_type=self.repo_type,
+                         revision=self.revision)
+        try:
+            if rf.size > max_bytes:
+                raise RuntimeError(f"{path} is {rf.size} B, over the {max_bytes} B cap")
+            return rf.read_range(0, rf.size).decode("utf-8", "replace")
+        finally:
+            rf.close()
+
     def download(self, remote: RemoteFile, local_dir: Path, force: bool = False) -> Path:
         """Download one file into local_dir, preserving its repo path."""
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -418,6 +417,17 @@ def _fill_from_results(report: FileReport, fmt: str, res, prof) -> None:
             "frame_rate_hz": res.frame_rate_hz,
             "episodes": (res.episodes or {}).get("count"),
         }
+    elif fmt in ("bag1", "bag2"):
+        report.valid = bool(res.is_bag and not res.error)
+        report.error = res.error
+        report.summary = {
+            "bag_version": res.version,
+            "storage": res.storage,
+            "channels": len(res.connections or []),
+            "topics": res.topics or [],
+            "chunks": res.chunk_count,
+            "compression": res.compression,
+        }
     else:
         report.valid = bool(res.is_matfile and not res.error)
         report.error = res.error
@@ -451,17 +461,25 @@ def inspect_local_file(repo_path: str, local_path: Path, size_hint: int | None, 
             res = McapFileInspector(str(local_path)).inspect()
         elif fmt == "mat":
             res = MatFileInspector(str(local_path)).inspect()
-        elif fmt == "parquet":
+        elif fmt in ("parquet", "bag1", "bag2"):
             rf = LocalRangeFile(local_path, block_size=1024 * 1024)
             try:
-                res, prof = inspect_parquet(rf, column_budget_bytes=1 << 62, nan_check=True)
+                if fmt == "parquet":
+                    res, prof = inspect_parquet(rf, column_budget_bytes=1 << 62, nan_check=True)
+                elif fmt == "bag1":
+                    res, prof = inspect_bag1_remote(rf, msgidx_budget_bytes=1 << 62)
+                else:
+                    sidecar = local_path.parent / "metadata.yaml"
+                    res, prof = inspect_bag2_remote(
+                        rf, msgidx_budget_bytes=1 << 62, file_name=local_path.name,
+                        sidecar_yaml=(lambda: sidecar.read_text()) if sidecar.exists() else None)
             finally:
                 rf.close()
             _fill_from_results(report, fmt, res, prof)
             report.inspect_s = round(time.time() - t0, 3)
             return report
         else:
-            report.error = "Not recognised as MCAP, MAT or Parquet (magic bytes and extension both unknown)"
+            report.error = "Not recognised as MCAP, MAT, Parquet or ROS bag (magic bytes and extension both unknown)"
             report.inspect_s = round(time.time() - t0, 3)
             return report
         prof = None
@@ -477,6 +495,11 @@ def inspect_local_file(repo_path: str, local_path: Path, size_hint: int | None, 
         report.error = f"Inspection failed: {exc}"
     report.inspect_s = round(time.time() - t0, 3)
     return report
+
+
+def _sidecar_path(repo_path: str) -> str:
+    """The rosbag2 metadata.yaml that sits next to a .db3 file."""
+    return repo_path.rsplit("/", 1)[0] + "/metadata.yaml" if "/" in repo_path else "metadata.yaml"
 
 
 def inspect_remote_file(connector: HuggingFaceConnector, remote: RemoteFile, args, log) -> FileReport:
@@ -507,8 +530,18 @@ def inspect_remote_file(connector: HuggingFaceConnector, remote: RemoteFile, arg
                 workers=args.workers, log=log,
             )
             _fill_from_results(report, fmt, res, prof)
+        elif fmt == "bag1":
+            res, prof = inspect_bag1_remote(
+                rf, msgidx_budget_bytes=int(args.msgidx_budget_mb * 1024 * 1024), workers=args.workers, log=log)
+            _fill_from_results(report, fmt, res, prof)
+        elif fmt == "bag2":
+            res, prof = inspect_bag2_remote(
+                rf, msgidx_budget_bytes=int(args.msgidx_budget_mb * 1024 * 1024), workers=args.workers, log=log,
+                sidecar_yaml=lambda: connector.read_text(_sidecar_path(remote.path)),
+                file_name=remote.path.rsplit("/", 1)[-1])
+            _fill_from_results(report, fmt, res, prof)
         else:
-            report.error = "Not recognised as MCAP, MAT or Parquet (magic bytes and extension both unknown)"
+            report.error = "Not recognised as MCAP, MAT, Parquet or ROS bag (magic bytes and extension both unknown)"
     except Exception as exc:
         report.error = f"Remote inspection failed: {exc}"
     finally:
@@ -578,7 +611,7 @@ def render_markdown(run: RunReport) -> str:
     L.append(f"| By mode | {', '.join(f'{k}: {v}' for k, v in t['by_mode'].items()) or '-'} |")
     L.append(f"| Total size | {_human_size(t['bytes'])} |")
     L.append(f"| Bytes read from Hub | {_human_size(t['bytes_fetched'])} ({_pct(t['bytes_fetched'], t['bytes'])}) in {t['requests']} requests |")
-    L.append(f"| Messages (MCAP) / rows (MAT) | {t['messages']:,} |")
+    L.append(f"| Messages (MCAP, bags) / rows (MAT, Parquet) | {t['messages']:,} |")
     L.append(f"| Total duration | {t['duration_s']} s |")
     L.append(f"| Findings | {t['findings']} (warn {t['warnings']}, error {t['errors']}) |")
     L.append("")
@@ -643,6 +676,19 @@ def render_markdown(run: RunReport) -> str:
                 if len(variables) > 200:
                     L.append(f"| ... {len(variables) - 200} more | | | | |")
 
+        if f.detected_format in ("bag1", "bag2") and f.basic:
+            b = f.basic
+            if f.detected_format == "bag1":
+                L.append(f"- ROS 1 bag V{b.get('version') or '?'}, {'indexed' if b.get('indexed') else 'no index'}; "
+                         f"{b.get('chunk_count') or 0} chunk(s), compression {', '.join(b.get('compression') or ['-'])}")
+            else:
+                L.append(f"- ROS 2 bag, storage `{b.get('storage') or '-'}`, metadata v{b.get('version') or '-'} "
+                         f"({b.get('metadata_source') or 'none found'}), distro `{b.get('ros_distro') or '-'}`, "
+                         f"page size {b.get('page_size')}; {b.get('leaves_read')} leaf page(s) read")
+            if b.get("message_count") is not None:
+                L.append(f"- Messages: {b['message_count']:,}"
+                         + (f" over {b['duration_s']:.1f} s" if b.get("duration_s") else ""))
+
         if f.detected_format == "parquet" and f.basic:
             b = f.basic
             L.append(f"- Rows: {b.get('num_rows') or 0:,} in {b.get('num_row_groups')} row group(s); "
@@ -675,7 +721,7 @@ def render_markdown(run: RunReport) -> str:
 
         rich = f.rich or {}
         channels = rich.get("channels") or []
-        if channels and f.detected_format == "mcap":
+        if channels and f.detected_format in ("mcap", "bag1", "bag2"):
             L.append("")
             L.append("| Topic | Schema | Modality | Count | Rate (Hz) | Jitter (ms) | Gaps>3x | Max gap (ms) |")
             L.append("|---|---|---|---|---|---|---|---|")
@@ -856,6 +902,12 @@ def run(args: argparse.Namespace) -> RunReport:
             t0 = time.time()
             try:
                 local_path = connector.download(remote, local_root, force=args.force_download)
+                if remote.path.lower().endswith(".db3"):
+                    try:
+                        connector.download(RemoteFile(_sidecar_path(remote.path), None), local_root,
+                                           force=args.force_download)
+                    except Exception:
+                        pass  # the bag may embed its metadata, or have none
                 dl_s = round(time.time() - t0, 2)
                 downloaded += 1
             except Exception as exc:
@@ -947,7 +999,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sel = p.add_argument_group("file selection")
     sel.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS),
-                     help="Extensions to consider (default: .mcap .mat .parquet)")
+                     help="Extensions to consider (default: .mcap .mat .parquet .bag .db3)")
     sel.add_argument("--include", action="append", help="Glob on repo path; repeatable")
     sel.add_argument("--exclude", action="append", help="Glob on repo path to skip; repeatable")
     sel.add_argument("--file", action="append", help="Exact repo path to fetch; repeatable (bypasses --ext)")

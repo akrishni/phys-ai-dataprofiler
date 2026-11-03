@@ -28,6 +28,34 @@ Tools to inspect binary file formats and extract metadata, structure, and conten
 1. **MCAP File Inspector** - Inspect MCAP (Message Capture) files
 2. **MATLAB File Inspector** - Inspect MATLAB .mat files
 
+## ROS bag support
+
+`.bag` (ROS 1, format V2.0) and `.db3` (ROS 2, SQLite storage) files are profiled from byte ranges, like
+MCAP. ROS 2 bags in MCAP storage are plain `.mcap` files and use the MCAP path. Code:
+`phys_ai_dataprofiler/remote/rosbag.py`.
+
+- **ROS 1:** the bag header points to the index at the end of the file (connections plus per-chunk counts
+  and time ranges). Per-message timestamps come from the IndexData records after each chunk, 12 bytes per
+  message, one request per chunk. Chunk payloads are never read, so compression (bz2, lz4) makes no
+  difference. Over `--msgidx-budget-mb`, chunks are sampled; counts stay exact. Bags with no index
+  (recorder killed) are walked record by record and reported `unindexed_bag`; truncated bags are reported
+  `truncated`. Old V1.2 bags are identified but not parsed.
+- **ROS 2 SQLite:** a small read-only SQLite reader descends the `messages` table B-tree. Each row's
+  `topic_id` and `timestamp` sit at the start of its leaf cell, so message payloads and their overflow
+  pages are never read. Counts and duration come from the `metadata` table, or from the `metadata.yaml`
+  next to the `.db3` when the database has none. Over budget, runs of leaf pages are sampled and the
+  start and end times come from `timestamp_idx`. Without any metadata, sampled per-topic counts are
+  estimates, reported as `estimated_counts`.
+
+Timing statistics use the same code as MCAP. Tests compare every case against a full read through
+`rosbags`: `python tests/test_rosbag_inspector.py` (add `--hub` for two public bags).
+
+| Dataset | Result | Read |
+|---|---|---|
+| `Adapting/nuscenes-rosbags` `103.bag` (ROS 1) | 14 topics, 1,585 chunks, 19.5 s | 533 KB of 5.8 GB |
+| `dvar1ch/ros2-bag-datasets` (ROS 2 SQLite, 2 files) | `/image` at 30 Hz, metadata v9, jazzy | 1.5 MB of 668 MB |
+| `liuxh010/IndoorLocalization_...` (ROS 1), `UniflexAI/rosbag_lekiwi_exp_result` (ROS 2) | per-topic stats identical to a full read | 146 KB of 891 KB; 2.1 MB of 18.6 MB |
+
 ## Parquet support
 
 Parquet keeps its schema, row groups and per-column statistics in a footer at the end of the file, so the

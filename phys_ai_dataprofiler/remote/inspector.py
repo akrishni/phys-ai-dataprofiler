@@ -48,6 +48,7 @@ from phys_ai_dataprofiler.inspectors.mat import (
 )
 from phys_ai_dataprofiler.inspectors.rich import Finding, RichProfile, mat_channel_profile, profile_mcap_channels
 from phys_ai_dataprofiler.remote.range_file import RangeFile
+from phys_ai_dataprofiler.remote.rosbag import BAG_MAGIC_PREFIX, SQLITE_MAGIC, _Sqlite
 
 try:
     from mcap.reader import SeekingReader, FOOTER_SIZE, MAGIC_SIZE
@@ -71,6 +72,11 @@ def sniff_format(rf: RangeFile, name: str = "") -> str:
         return "mcap"
     if head[:4] == b"PAR1":
         return "parquet"
+    if head.startswith(BAG_MAGIC_PREFIX):
+        return "bag1"
+    if head[:16] == SQLITE_MAGIC:
+        # rosbag2 SQLite storage, or some other SQLite database.
+        return "bag2" if _is_rosbag2_sqlite(rf) else "unknown"
     if MatFileInspector._detect_format(head) in ("v5", "v7.3"):
         return "mat"
     ext = Path(name).suffix.lower()
@@ -80,7 +86,17 @@ def sniff_format(rf: RangeFile, name: str = "") -> str:
         return "mat"
     if ext == ".parquet":
         return "parquet"
+    if ext == ".bag":
+        return "bag1"
     return "unknown"
+
+
+def _is_rosbag2_sqlite(rf: RangeFile) -> bool:
+    try:
+        names = {r[1] for _, r in _Sqlite(rf).table_rows(1, max_pages=64) if len(r) >= 2}
+    except Exception:
+        return False
+    return {"messages", "topics"} <= names
 
 
 # --------------------------------------------------------------------------- #
