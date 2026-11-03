@@ -1,0 +1,22 @@
+version: 1
+name: teleop-imitation
+description: >
+  Imitation learning from teleoperation (ACT, diffusion policy and similar): at least one camera
+  at 10 Hz or more, joint/robot state at 10 Hz or more with no gap over 200 ms, 1 hour, 50 episodes.
+files:
+  exclude: ["meta/*"]    # LeRobot metadata tables are not recordings
+streams:
+  - name: camera
+    match: {modality: video}
+    min_rate_hz: 10
+  - name: robot state
+    match: {modality: proprio}
+    min_rate_hz: 10
+    max_gap_ms: 200
+  - name: actions
+    required: false
+    match: {modality: action}
+dataset:
+  min_total_hours: 1
+  min_episodes: 50
+  max_invalid_files_pct: 0

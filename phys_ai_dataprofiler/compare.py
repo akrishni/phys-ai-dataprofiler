@@ -1,0 +1,120 @@
+"""
+Put several datasets side by side against the same requirements.
+
+Each candidate is a run report (dict, as written by the CLI). The result has
+one row per check and one column per dataset, plus a ranking: fewer required
+failures first, then fewer unknowns, then more passes, then more hours.
+Ties keep the order the datasets were given in.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from phys_ai_dataprofiler.evaluate import BADGE, FAIL, PASS, UNKNOWN, Verdict, evaluate, verdict_to_dict
+from phys_ai_dataprofiler.requirements import Requirements
+
+
+@dataclass
+class Candidate:
+    label: str
+    report: dict
+    verdict: Verdict
+
+    @property
+    def hours(self) -> float:
+        return (self.report.get("totals") or {}).get("duration_s", 0) / 3600
+
+    def sort_key(self) -> tuple:
+        req = [c for c in self.verdict.checks if c.required]
+        return (sum(c.status == FAIL for c in req), sum(c.status == UNKNOWN for c in req),
+                -sum(c.status == PASS for c in self.verdict.checks), -self.hours)
+
+
+def compare_reports(reports: list[tuple[str, dict]], req: Requirements) -> list[Candidate]:
+    cands = [Candidate(label, rep, evaluate(rep, req)) for label, rep in reports]
+    order = sorted(range(len(cands)), key=lambda i: (cands[i].sort_key(), i))
+    return [cands[i] for i in order]
+
+
+def _size(n: int | None) -> str:
+    if not n:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _cell(text: str) -> str:
+    return text.replace("|", "/").replace("\n", " ")
+
+
+def render_compare_markdown(cands: list[Candidate], req: Requirements) -> str:
+    L = [f"# Dataset comparison against `{req.name}`", ""]
+    if req.description:
+        L += [req.description, ""]
+    L.append(f"Requirements: `{req.source}`. Ranked best first: fewer required failures, then fewer unknowns, "
+             "then more passes, then more hours.")
+    L.append("")
+    head = "| | " + " | ".join(f"{i + 1}. `{c.label}`" for i, c in enumerate(cands)) + " |"
+    L += [head, "|---|" + "---|" * len(cands)]
+    L.append("| **Verdict** | " + " | ".join(f"**{BADGE[c.verdict.status]}** "
+                                              f"({c.verdict.passed}/{c.verdict.failed}/{c.verdict.unknown})"
+                                              for c in cands) + " |")
+    totals = [c.report.get("totals") or {} for c in cands]
+    L.append("| Files profiled | " + " | ".join(f"{t.get('files', 0)} ({t.get('invalid_or_errored', 0)} errored)"
+                                                for t in totals) + " |")
+    L.append("| Hours | " + " | ".join(f"{c.hours:.2f}" for c in cands) + " |")
+    L.append("| Size / read | " + " | ".join(f"{_size(t.get('bytes'))} / {_size(t.get('bytes_fetched'))}"
+                                              for t in totals) + " |")
+    ids = list(dict.fromkeys(ch.id for c in cands for ch in c.verdict.checks))
+    for cid in ids:
+        label = next(ch.label for c in cands for ch in c.verdict.checks if ch.id == cid)
+        opt = next((not ch.required) for c in cands for ch in c.verdict.checks if ch.id == cid)
+        row = []
+        for c in cands:
+            ch = next((x for x in c.verdict.checks if x.id == cid), None)
+            row.append("-" if ch is None else _cell(f"{BADGE[ch.status]}: {ch.headline or ch.observed}"))
+        L.append(f"| {label}{' (optional)' if opt else ''} | " + " | ".join(row) + " |")
+    L.append("")
+    L.append("Cells show status and what was found. (n/n/n) is passed/failed/unknown checks.")
+    L.append("")
+    for i, c in enumerate(cands):
+        bad = [ch for ch in c.verdict.checks if ch.status != PASS]
+        if not bad and not c.verdict.notes:
+            continue
+        L.append(f"## {i + 1}. `{c.label}`: why not pass")
+        L.append("")
+        for n in c.verdict.notes:
+            L.append(f"- Note: {n}")
+        for ch in bad:
+            L.append(f"- **{ch.label}** {BADGE[ch.status]}: {ch.observed}")
+            for e in ch.evidence[:3]:
+                L.append(f"  - {e}")
+            if ch.resolve:
+                L.append(f"  - To settle: {ch.resolve}")
+        L.append("")
+    return "\n".join(L)
+
+
+def print_compare(cands: list[Candidate], log) -> None:
+    log("")
+    log("COMPARISON (best first)")
+    for i, c in enumerate(cands, 1):
+        v = c.verdict
+        log(f"  {i}. {BADGE[v.status]:<8} {c.label}  ({v.passed} pass, {v.failed} fail, {v.unknown} unknown; "
+            f"{c.hours:.2f} h)")
+        for ch in v.checks:
+            if ch.status != PASS:
+                log(f"       {BADGE[ch.status]:<8} {ch.label}: {ch.observed}")
+
+
+def compare_to_dict(cands: list[Candidate], req: Requirements) -> dict:
+    return {
+        "requirements": req.name, "requirements_source": req.source,
+        "ranking": [{"rank": i + 1, "label": c.label, "repo_id": c.report.get("repo_id"),
+                     "status": c.verdict.status, "hours": round(c.hours, 4),
+                     "verdict": verdict_to_dict(c.verdict)} for i, c in enumerate(cands)],
+    }

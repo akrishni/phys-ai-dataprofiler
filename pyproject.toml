@@ -7,11 +7,11 @@ name = "phys-ai-dataprofiler"
 version = "0.2.0"
 description = "Zero-copy profiling of physical-AI dataset files (MCAP, ROS bag, MATLAB, Parquet) on the Hugging Face Hub"
 requires-python = ">=3.10"
-dependencies = ["huggingface_hub>=1.0", "mcap>=1.0", "numpy", "scipy", "pyarrow>=14"]
+dependencies = ["huggingface_hub>=1.0", "mcap>=1.0", "numpy", "scipy", "pyarrow>=14", "pyyaml>=6"]
 
 [project.optional-dependencies]
 mat73 = ["h5py"]          # MAT v7.3 (HDF5) support; needs Python <= 3.13 for wheels today
-rosbag = ["rosbags"]
+rosbag = ["rosbags", "lz4"]   # rosbags writes test bags; lz4 decodes lz4 chunks of unindexed ROS 1 bags
 dev = ["pytest"]
 
 [project.scripts]
@@ -19,3 +19,6 @@ phys-ai-dataprofiler = "phys_ai_dataprofiler.connectors.huggingface:main"
 
 [tool.setuptools.packages.find]
 include = ["phys_ai_dataprofiler*"]
+
+[tool.setuptools.package-data]
+phys_ai_dataprofiler = ["presets/*.yaml"]

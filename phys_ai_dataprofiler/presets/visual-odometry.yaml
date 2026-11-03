@@ -1,0 +1,21 @@
+version: 1
+name: visual-odometry
+description: >
+  Visual(-inertial) odometry and SLAM: a camera at 15 Hz or more with no gap over 200 ms, an IMU
+  at 100 Hz or more (optional, for VIO), consistent message types across files.
+files:
+  exclude: ["meta/*"]    # LeRobot metadata tables are not recordings
+streams:
+  - name: camera
+    match: {modality: video, exclude_topic: ["*camera_info*", "*info"]}
+    min_rate_hz: 15
+    max_gap_ms: 200
+  - name: imu
+    required: false
+    match: {modality: imu, exclude_topic: ["*odom*"]}
+    min_rate_hz: 100
+    max_gap_ms: 50
+dataset:
+  same_schema_across_files: true
+  max_invalid_files_pct: 0
+  max_unindexed_files_pct: 0

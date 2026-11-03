@@ -28,6 +28,35 @@ Tools to inspect binary file formats and extract metadata, structure, and conten
 1. **MCAP File Inspector** - Inspect MCAP (Message Capture) files
 2. **MATLAB File Inspector** - Inspect MATLAB .mat files
 
+## Requirements and verdicts
+
+Say what your model needs in a YAML file, and the profiler answers pass, fail or unknown for each
+requirement, with evidence and, for unknowns, how to settle them. Checks are deterministic rules, with no
+model call. Full reference: [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).
+
+```bash
+phys-ai-dataprofiler check org/dataset -r preset:teleop-imitation        # exit 0 pass, 1 fail, 4 unknown
+phys-ai-dataprofiler compare org/a org/b -r my_requirements.yaml          # rank candidate datasets
+phys-ai-dataprofiler check --report reports/run.json -r my_requirements.yaml   # re-check offline
+```
+
+```yaml
+streams:
+  - name: camera
+    match: {modality: video}
+    min_rate_hz: 25
+  - name: joint state
+    match: {topic: ["/joint_states", "observation.state"]}
+    min_rate_hz: 50
+    max_gap_ms: 100
+dataset:
+  min_total_hours: 20
+  min_episodes: 500
+```
+
+A number that was sampled and lies within 10% of the threshold, a NaN count the format cannot provide,
+or a file that failed to profile makes the result **unknown**, never a guessed pass.
+
 ## ROS bag support
 
 `.bag` (ROS 1, format V2.0) and `.db3` (ROS 2, SQLite storage) files are profiled from byte ranges, like

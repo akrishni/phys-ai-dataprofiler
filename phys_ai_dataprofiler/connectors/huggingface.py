@@ -121,6 +121,7 @@ class RunReport:
     files: list[FileReport]
     totals: dict
     run_cost_s: float
+    verdict: dict | None = None            # set when --requirements is given
 
 
 # --------------------------------------------------------------------------- #
@@ -583,7 +584,7 @@ def build_totals(files: list[FileReport]) -> dict:
     }
 
 
-def render_markdown(run: RunReport) -> str:
+def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
     L: list[str] = []
     L.append(f"# Inspection report: `{run.repo_type}/{run.repo_id}`")
     L.append("")
@@ -598,6 +599,9 @@ def render_markdown(run: RunReport) -> str:
     L.append(f"- Selected size: {_human_size(run.total_bytes_selected)}")
     L.append(f"- Run time: {run.run_cost_s:.1f} s")
     L.append("")
+    if verdict_md:
+        L.append(verdict_md)
+        L.append("")
 
     t = run.totals
     L.append("## Totals")
@@ -955,22 +959,25 @@ def run(args: argparse.Namespace) -> RunReport:
     )
 
 
-def write_reports(run_report: RunReport, report_dir: Path, basename: str | None, log) -> tuple[Path, Path]:
+def write_reports(run_report: RunReport, report_dir: Path, basename: str | None, log,
+                  verdict_md: str | None = None) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = basename or f"{run_report.repo_type}__{run_report.repo_id.replace('/', '__')}__{stamp}"
     json_path = report_dir / f"{base}.json"
     md_path = report_dir / f"{base}.md"
     json_path.write_text(json.dumps(_to_jsonable(run_report), indent=2))
-    md_path.write_text(render_markdown(run_report))
+    md_path.write_text(render_markdown(run_report, verdict_md))
     log(f"JSON report: {json_path}")
     log(f"Markdown report: {md_path}")
     return json_path, md_path
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Inspect MCAP, MAT and Parquet files in a Hugging Face repo and write a report.",
+        prog=prog,
+        description="Profile MCAP, ROS bag, MAT and Parquet files in a Hugging Face repo and write a report. "
+                    "Other commands: check, compare, requirements (run '<command> -h').",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1007,6 +1014,11 @@ def build_parser() -> argparse.ArgumentParser:
     sel.add_argument("--max-file-mb", type=float, help="Skip files larger than this")
     sel.add_argument("--max-total-mb", type=float, help="Cap the total selected size")
 
+    rq = p.add_argument_group("requirements")
+    rq.add_argument("--requirements", "-r", metavar="FILE|preset:NAME",
+                    help="Check the profile against a requirements YAML file or built-in preset and add a "
+                         "pass/fail/unknown verdict to the report. Exit code: 0 pass, 1 fail, 4 unknown")
+
     io = p.add_argument_group("storage and output")
     io.add_argument("--download-dir", default="./hf_downloads", help="Where downloaded files are stored")
     io.add_argument("--report-dir", default="./reports", help="Where the JSON/Markdown reports go")
@@ -1024,9 +1036,30 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+SUBCOMMANDS = ("check", "compare", "requirements")
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in SUBCOMMANDS:
+        from phys_ai_dataprofiler import cli
+        return cli.main(argv)
     args = build_parser().parse_args(argv)
+    return profile_main(args)
+
+
+def profile_main(args: argparse.Namespace) -> int:
+    """Profile one repo; with --requirements, add a verdict. Shared by the default command and `check`."""
     log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, file=sys.stderr))
+    req = None
+    if getattr(args, "requirements", None):
+        from phys_ai_dataprofiler.requirements import RequirementsError, load_requirements
+        try:
+            req = load_requirements(args.requirements)    # fail fast, before any network traffic
+        except RequirementsError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _apply_requirements_scope(args, req)
     try:
         run_report = run(args)
     except NothingToProfile as exc:
@@ -1039,15 +1072,36 @@ def main(argv: list[str] | None = None) -> int:
         print("Interrupted.", file=sys.stderr)
         return 130
 
+    verdict = verdict_md = None
+    if req is not None and not args.dry_run:
+        from phys_ai_dataprofiler.evaluate import evaluate, render_verdict_markdown, verdict_to_dict
+        verdict = evaluate(_to_jsonable(run_report), req)
+        run_report.verdict = verdict_to_dict(verdict)
+        verdict_md = render_verdict_markdown(verdict)
+
     if not args.dry_run:
         print_console_summary(run_report, log)
-    write_reports(run_report, Path(args.report_dir), args.report_name, log)
+        if verdict is not None:
+            from phys_ai_dataprofiler.evaluate import print_verdict
+            print_verdict(verdict, log)
+    if not getattr(args, "no_report", False):
+        write_reports(run_report, Path(args.report_dir), args.report_name, log, verdict_md)
     if args.print_json:
         print(json.dumps(_to_jsonable(run_report), indent=2))
 
+    if verdict is not None:
+        return verdict.exit_code
     if not args.dry_run and run_report.totals["invalid_or_errored"] > 0:
         return 1
     return 0
+
+
+def _apply_requirements_scope(args: argparse.Namespace, req) -> None:
+    """files.include/exclude in the requirements narrow what gets profiled, on top of --include/--exclude."""
+    if req.files_include and not args.include and not args.file:
+        args.include = list(req.files_include)
+    if req.files_exclude:
+        args.exclude = list(args.exclude or []) + list(req.files_exclude)
 
 
 if __name__ == "__main__":

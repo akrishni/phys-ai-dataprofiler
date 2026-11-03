@@ -255,7 +255,7 @@ bandwidth or CPU. Chunk sampling caps per-file requests when files have tens of 
 |---|---|---|
 | 0 (done) | MCAP and MAT v5/v7 metadata-only inspection over Hub byte ranges; report with bytes-read accounting. | |
 | 1 | `bag1` and `bag2` (SQLite) adapters (done 2026-11-03, `remote/rosbag.py`); FileProfile schema and merge; local content-hash cache; dataset roll-up; process-pool fan-out with rate limiting. | ROS 1 walk prototype from this session. |
-| 2 | Requirements file, evaluator, verdict report; `--sample` and `--compare`. | Phase 1 schema. |
+| 2 | Requirements file, evaluator, verdict report (done 2026-11-03: `requirements.py`, `evaluate.py`, `compare.py`, `check`/`compare` commands, 4 presets; see `docs/REQUIREMENTS.md`); `--sample`. | Phase 1 schema. |
 | 3 | T2 sampling tier (payload decodes, NaN scan); `lerobot` adapter; quality rules engine. | Phase 1 schema. |
 | 4 | Local HTML report with charts; MAT v7.3 via h5py over RangeFile; S3/GCS endpoints. | |
 | 5 (optional) | SSH fan-out to lab machines with the laptop as merge point. | Phase 1 idempotent workers. |

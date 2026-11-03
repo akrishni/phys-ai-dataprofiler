@@ -1,0 +1,15 @@
+version: 1
+name: lidar-perception
+description: >
+  LiDAR perception and mapping: a LiDAR point cloud stream at 5 Hz or more with no gap over 500 ms,
+  10 minutes of data.
+files:
+  exclude: ["meta/*"]    # LeRobot metadata tables are not recordings
+streams:
+  - name: lidar
+    match: {modality: lidar, schema: ["*PointCloud*", "*LaserScan*"]}
+    min_rate_hz: 5
+    max_gap_ms: 500
+dataset:
+  min_total_hours: 0.17
+  max_invalid_files_pct: 0

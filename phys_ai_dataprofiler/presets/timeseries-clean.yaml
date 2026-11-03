@@ -1,0 +1,14 @@
+version: 1
+name: timeseries-clean
+description: >
+  Numeric lab and sensor data (battery cycling, MATLAB or Parquet exports): every float stream free
+  of NaN/inf values, all files readable. NaN counts are measured for MAT and Parquet only.
+files:
+  exclude: ["meta/*"]
+streams:
+  - name: float data
+    match: {topic: "*", modality: [data, timeseries, proprio, action, imu]}
+    min_count: all
+    max_nan: 0
+dataset:
+  max_invalid_files_pct: 0
