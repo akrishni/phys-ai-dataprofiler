@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phys-ai-dataprofiler"
+version = "0.2.0"
+description = "Zero-copy profiling of physical-AI dataset files (MCAP, ROS bag, MATLAB, Parquet) on the Hugging Face Hub"
+requires-python = ">=3.10"
+dependencies = ["huggingface_hub>=1.0", "mcap>=1.0", "numpy", "scipy", "pyarrow>=14"]
+
+[project.optional-dependencies]
+mat73 = ["h5py"]          # MAT v7.3 (HDF5) support; needs Python <= 3.13 for wheels today
+rosbag = ["rosbags"]
+dev = ["pytest"]
+
+[project.scripts]
+phys-ai-dataprofiler = "phys_ai_dataprofiler.connectors.huggingface:main"
+
+[tool.setuptools.packages.find]
+include = ["phys_ai_dataprofiler*"]

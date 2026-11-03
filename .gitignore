@@ -1,0 +1,11 @@
+venv/
+venv311/
+__pycache__/
+*.pyc
+.DS_Store
+data/
+hf_downloads/
+reports/*.json
+reports/*.md
+!reports/data_profile.json
+*.egg-info/
