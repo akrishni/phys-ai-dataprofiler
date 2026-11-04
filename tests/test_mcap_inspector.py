@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Test script for MCAP file inspector."""
+"""Checks for the full-read MCAP inspector.
+
+    python tests/test_mcap_inspector.py              # checks against samples/ (exits non-zero on failure)
+    python tests/test_mcap_inspector.py FILE_OR_URL  # print what the inspector finds in one file
+"""
 
 import sys
 from pathlib import Path
@@ -56,18 +60,39 @@ def print_result(result):
             print(f"    Data size: {len(schema.data)} bytes")
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python test_inspector.py <mcap_file_or_url>")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def check(cond: bool, msg: str) -> None:
+    print(("PASS " if cond else "FAIL ") + msg)
+    if not cond:
         sys.exit(1)
 
+
+def run_checks() -> None:
+    r = McapFileInspector(str(ROOT / "samples" / "sample.mcap")).inspect()
+    check(r.is_mcap and r.error is None, "sample.mcap is recognised and parses")
+    check(r.header is not None and (r.header.profile, r.header.library) == ("test", "sample_creator"),
+          "header profile and library")
+    check(r.topics == ["/sensors/gps", "/sensors/imu"], f"topics {r.topics}")
+    check(len(r.channels or []) == 2 and all(c.message_encoding for c in r.channels), "two channels with encodings")
+    check([s.name for s in r.schemas or []] == ["example.Point"], "schema name")
+    check(r.footer is not None and r.footer.summary_start > 0, "footer points to a summary section")
+
+    bad = McapFileInspector(str(ROOT / "samples" / "test.txt")).inspect()
+    check(not bad.is_mcap, "a text file is not an MCAP")
+    missing = McapFileInspector(str(ROOT / "samples" / "does_not_exist.mcap")).inspect()
+    check(not missing.is_mcap and missing.error, "a missing file reports an error instead of raising")
+    print("all checks passed")
+
+
+def main():
+    if len(sys.argv) < 2:
+        run_checks()
+        return
     url = sys.argv[1]
     print(f"Inspecting: {url}\n")
-
-    inspector = McapFileInspector(url)
-    result = inspector.inspect()
-
-    print_result(result)
+    print_result(McapFileInspector(url).inspect())
 
 
 if __name__ == "__main__":

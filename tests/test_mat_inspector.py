@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Test script for MATLAB file inspector."""
+"""Checks for the full-read MATLAB inspector.
+
+    python tests/test_mat_inspector.py              # checks against samples/ (exits non-zero on failure)
+    python tests/test_mat_inspector.py FILE_OR_URL  # print what the inspector finds in one file
+"""
 
 import sys
 from pathlib import Path
@@ -61,18 +65,44 @@ def print_result(result):
                 print(f"    Fields: {', '.join(var.field_names)}")
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python tests/test_mat_inspector.py <mat_file_or_url>")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def check(cond: bool, msg: str) -> None:
+    print(("PASS " if cond else "FAIL ") + msg)
+    if not cond:
         sys.exit(1)
 
+
+def run_checks() -> None:
+    r = MatFileInspector(str(ROOT / "samples" / "sample_v5.mat")).inspect()
+    check(r.is_matfile and r.error is None and r.file_format == "v5", "sample_v5.mat parses as v5")
+    check(len(r.variable_names or []) == 12, f"12 variables, got {len(r.variable_names or [])}")
+    v = {x.name: x for x in r.variables or []}
+    check(v["matrix_2d"].dtype == "float64" and tuple(v["matrix_2d"].shape) == (3, 4), "2-D double matrix")
+    check(tuple(v["matrix_3d"].shape) == (2, 3, 4), "3-D shape kept")
+    check(v["complex_data"].dtype == "complex128", "complex type")
+    check(v["int_array"].dtype == "int32" and v["uint_array"].dtype == "uint16", "integer types")
+    check(v["float_data"].dtype == "float32", "single precision")
+
+    r = MatFileInspector(str(ROOT / "samples" / "sample_v7.mat")).inspect()
+    check(r.is_matfile and r.error is None, "sample_v7.mat (compressed) parses")
+    v = {x.name: x for x in r.variables or []}
+    check(sorted(v) == ["device_id", "location", "sample_rate", "sensor_data", "timestamps"], "v7 variable names")
+    check(tuple(v["sensor_data"].shape) == (100, 3) and tuple(v["timestamps"].shape) == (1, 100), "v7 shapes")
+
+    bad = MatFileInspector(str(ROOT / "samples" / "test.txt")).inspect()
+    check(not bad.is_matfile, "a text file is not a MAT file")
+    print("all checks passed")
+
+
+def main():
+    if len(sys.argv) < 2:
+        run_checks()
+        return
     url = sys.argv[1]
     print(f"Inspecting: {url}\n")
-
-    inspector = MatFileInspector(url)
-    result = inspector.inspect()
-
-    print_result(result)
+    print_result(MatFileInspector(url).inspect())
 
 
 if __name__ == "__main__":

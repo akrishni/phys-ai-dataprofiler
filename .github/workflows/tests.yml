@@ -1,0 +1,79 @@
+name: tests
+
+# Every push to any branch, every pull request, and a manual run from the Actions tab.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      hub:
+        description: "Also run the checks that profile small public Hugging Face datasets"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the run still in progress for it.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[mat73,rosbag,dev]"
+
+      - name: Run all tests (offline)
+        run: python tests/run_all.py
+
+      - name: Run Hub checks
+        if: github.event_name == 'workflow_dispatch' && inputs.hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python tests/run_all.py --hub
+
+  package:
+    name: Build and check the package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Install the wheel alone and smoke-test the CLI
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/smoke/bin/phys-ai-dataprofiler --version
+          /tmp/smoke/bin/phys-ai-dataprofiler requirements list
+          /tmp/smoke/bin/phys-ai-dataprofiler requirements validate preset:teleop-imitation
