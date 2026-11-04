@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "phys-ai-dataprofiler: zero-copy profiling of physical-AI datasets"
+type: software
+authors:
+  - family-names: Krishniyer
+    given-names: Anand
+    email: akrishniyer@gmail.com
+version: 0.3.0
+date-released: 2026-11-03
+license: MIT
+repository-code: "https://github.com/akrishni/phys-ai-dataprofiler"
+url: "https://pypi.org/project/phys-ai-dataprofiler/"
+keywords:
+  - robotics
+  - datasets
+  - MCAP
+  - ROS bag
+  - data quality
+  - Hugging Face
+abstract: >
+  Profiles MCAP, ROS 1 and ROS 2 bags, MATLAB and Parquet datasets on the Hugging Face Hub through
+  HTTP range requests, without downloading them, and checks them against a YAML requirements file.

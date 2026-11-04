@@ -1,6 +1,8 @@
-"""phys_ai_dataprofiler: zero-copy profiling of physical-AI dataset files (MCAP, ROS bag, MATLAB, Parquet)."""
+"""phys_ai_dataprofiler: zero-copy profiling of physical-AI dataset files (MCAP, ROS bag, MATLAB, Parquet).
 
-__version__ = "0.2.0"
+Copyright (c) 2026 Anand Krishniyer. MIT License."""
+
+__version__ = "0.3.0"
 
 from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector, McapInspectionResult  # noqa: F401
 from phys_ai_dataprofiler.inspectors.mat import MatFileInspector, MatInspectionResult  # noqa: F401

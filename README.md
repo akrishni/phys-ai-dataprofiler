@@ -1,32 +1,49 @@
-# File Inspectors
+# phys-ai-dataprofiler
 
-## Repository layout
+[![tests](https://github.com/akrishni/phys-ai-dataprofiler/actions/workflows/tests.yml/badge.svg)](https://github.com/akrishni/phys-ai-dataprofiler/actions/workflows/tests.yml)
 
+Profile physical-AI and lab datasets on the Hugging Face Hub **without downloading them**, and check
+them against what your model needs.
+
+It reads only the bytes that hold metadata (headers, indexes, footers) through HTTP range requests,
+usually well under 1% of each file, and reports streams, message counts, rates, jitter, gaps, episodes,
+NaN counts and problems such as truncated or unindexed recordings. A requirements file turns that into a
+pass / fail / unknown verdict, and `compare` ranks candidate datasets side by side.
+
+| Format | What is read |
+|---|---|
+| MCAP (incl. ROS 2 MCAP storage) | header, footer, summary, message indexes |
+| ROS 1 bag (V2.0) | bag index and per-chunk index data; compressed payloads are skipped |
+| ROS 2 bag (SQLite `.db3`) | schema, topics, metadata and the leaf pages of the messages table |
+| MATLAB `.mat` (v5, v7, v7.3) | header and each variable's header; float data within a NaN budget |
+| Parquet / LeRobot | footer, column statistics, timestamp and episode columns |
+
+Measured on public Hub data: a 5.8 GB ROS 1 bag profiled from 533 KB, a 2.6 GB MAT v7.3 file from 808 KB.
+
+## Install
+
+```bash
+pip install phys-ai-dataprofiler
+pip install "phys-ai-dataprofiler[mat73]"      # MAT v7.3 (HDF5) files; needs Python 3.13 or older for h5py
 ```
-phys_ai_dataprofiler/            importable package (pip install -e .)
-  inspectors/  mcap.py  mat.py  rich.py      full-read inspectors for local files
-  remote/      range_file.py  inspector.py   byte-range file objects + metadata-only inspectors
-               parquet.py                    Parquet: footer, column stats, LeRobot-style timing
-  connectors/  huggingface.py                Hub connector and the `phys-ai-dataprofiler` CLI
-scripts/                    demos, sample-file generators, folder profilers
-tests/                      runnable checks against the sample files
-samples/                    small MCAP / MAT files used by scripts and tests
-docs/                       design, test-dataset list, lab-data sources, older notes
+
+Python 3.10 or newer. Public datasets need no account; for gated or private ones set `HF_TOKEN` (or run
+`hf auth login`). The token is only sent to huggingface.co, never to the CDN hosts that serve file bytes.
+
+## Quick start
+
+```bash
+phys-ai-dataprofiler org/dataset --dry-run              # what files are there, and how big
+phys-ai-dataprofiler org/dataset --max-files 10         # profile a sample -> reports/<repo>__<time>.md/.json
+
+phys-ai-dataprofiler requirements list                  # built-in presets
+phys-ai-dataprofiler requirements show teleop-imitation > req.yaml   # start your own, edit the numbers
+phys-ai-dataprofiler check org/dataset -r req.yaml      # verdict; exit 0 pass, 1 fail, 4 unknown
+phys-ai-dataprofiler compare org/a org/b -r req.yaml    # rank candidates against the same requirements
 ```
 
-Large downloaded datasets, generated reports and the virtualenv live outside this project, in
-`~/pers_workspace/adhoc/` (`data/`, `reports/`, `venv311/`). The virtualenv runs Python 3.11 and has this
-project installed in editable mode with the `h5py` (MAT v7.3) and `rosbags` extras. Activate it with
-`source ~/pers_workspace/adhoc/venv311/bin/activate`. To reinstall:
-`pip install -e ~/pers_workspace/phys-ai-dataprofiler[mat73,rosbag]`. Use Python 3.13 or older for a new
-environment: `h5py` has no wheel for 3.15 yet.
-
-Tools to inspect binary file formats and extract metadata, structure, and content information.
-
-## Available Inspectors
-
-1. **MCAP File Inspector** - Inspect MCAP (Message Capture) files
-2. **MATLAB File Inspector** - Inspect MATLAB .mat files
+Nothing is downloaded unless you ask for it (`--mode download`, or `--full-read-max-mb` for small files).
+Nothing is ever written to the Hub.
 
 ## Requirements and verdicts
 
@@ -267,9 +284,6 @@ The inspector uses the official [mcap](https://github.com/foxglove/mcap) library
 
 For remote files, the inspector first checks the magic bytes using HTTP Range requests, then downloads the full file for parsing if valid.
 
-## License
-
-This is a demonstration tool for MCAP file inspection.
 
 ---
 
@@ -493,12 +507,6 @@ profiles truncated MCAPs, which the full read cannot open. Anything partial
 (deleted afterwards unless `--keep-downloads`), or `--mode download` to go
 back to downloading everything.
 
-## Installation
-
-```bash
-source ~/pers_workspace/adhoc/venv311/bin/activate
-pip install huggingface_hub
-```
 
 ## Token
 
@@ -573,6 +581,38 @@ for f in selected:
     print(f.path, rf.bytes_fetched, "of", rf.size, "bytes read")
 ```
 
-## License
+---
 
-These are demonstration tools for file inspection.
+# Development
+
+```bash
+git clone https://github.com/akrishni/phys-ai-dataprofiler
+cd phys-ai-dataprofiler
+pip install -e ".[mat73,rosbag,dev]"
+python tests/run_all.py                  # every test script, with a summary
+python tests/run_all.py --hub            # also profile small public Hub datasets
+python tests/test_rosbag_inspector.py    # or run one script on its own
+```
+
+CI (`.github/workflows/tests.yml`) runs `tests/run_all.py` on every push and pull request, on Python 3.10
+to 3.13 on Linux and 3.13 on macOS, and builds the package and smoke-tests the installed CLI. The Hub
+checks need network access and are only run on demand: Actions tab, "tests", "Run workflow", tick
+"hub".
+
+```
+phys_ai_dataprofiler/
+  connectors/huggingface.py   Hub connector and the default CLI command
+  cli.py                      check, compare, requirements subcommands
+  requirements.py evaluate.py compare.py   requirements files, verdicts, comparisons
+  presets/                    built-in requirements files
+  remote/                     byte-range readers: MCAP, MAT, Parquet, ROS bags
+  inspectors/                 full-read inspectors for local files
+tests/  samples/  scripts/  docs/
+```
+
+## License and citation
+
+MIT License, copyright (c) 2026 Anand Krishniyer. See [LICENSE](LICENSE).
+
+If you use this tool in research, please cite it; GitHub's "Cite this repository" button (from
+[CITATION.cff](CITATION.cff)) gives a ready-made reference.

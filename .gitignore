@@ -9,3 +9,5 @@ reports/*.json
 reports/*.md
 !reports/data_profile.json
 *.egg-info/
+build/
+dist/
