@@ -84,6 +84,120 @@ def text_only() -> Path:
     return path
 
 
+def write(name: str, columns: dict, **kw) -> Path:
+    path = TMP / name
+    pq.write_table(pa.table(columns), path, **kw)
+    return path
+
+
+def inspect(path: Path, **kw):
+    return inspect_parquet(LocalRangeFile(path), **kw)
+
+
+def edge_cases() -> None:
+    # Integer timestamp units. Relative ns/us counters pass 1e9/1e8 after a few seconds, so magnitude
+    # alone would call them seconds; the step size has to decide.
+    for label, values, unit in [
+        ("relative ns, 200 s", np.arange(20_000, dtype=np.int64) * 10_000_000, "ns"),
+        ("relative ns, 5 s", np.arange(500, dtype=np.int64) * 10_000_000, "ns"),
+        ("relative us, 200 s", np.arange(20_000, dtype=np.int64) * 10_000, "us"),
+        ("relative ms, 2 h", np.arange(720_000, dtype=np.int64) * 10, "ms"),
+        ("epoch s", 1_700_000_000 + np.arange(100, dtype=np.int64), "s"),
+        ("epoch ms", 1_700_000_000_000 + np.arange(100, dtype=np.int64) * 10, "ms"),
+        ("epoch us", 1_700_000_000_000_000 + np.arange(100, dtype=np.int64) * 10_000, "us"),
+    ]:
+        res, _ = inspect(write(f"unit_{unit}_{len(values)}.parquet", {"t": pa.array(values)}))
+        expect = 1.0 if label == "epoch s" else 100.0
+        check(res.timestamp_unit == unit and abs(res.frame_rate_hz - expect) < 0.01,
+              f"int timestamps, {label}: unit {res.timestamp_unit}, {res.frame_rate_hz:.2f} Hz (want {unit}, {expect:g} Hz)")
+
+    res, _ = inspect(write("float_epoch.parquet", {"timestamp": pa.array(1.7e9 + np.arange(100) * 0.02)}))
+    check(res.timestamp_unit == "s" and abs(res.frame_rate_hz - 50) < 0.01, "float epoch seconds: 50 Hz")
+    res, _ = inspect(write("duration.parquet", {"time": pa.array(np.arange(100) * np.timedelta64(5, "ms"))}))
+    check(res.timestamp_unit == "ms" and abs(res.frame_rate_hz - 200) < 0.01, "duration[ms] column: 200 Hz")
+
+    # Column choice
+    res, _ = inspect(write("string_ts.parquet", {"timestamp": pa.array(["a", "b"]), "time": pa.array([0.0, 0.5])}))
+    check(res.timestamp_column == "time", "a non-numeric 'timestamp' column is passed over for 'time'")
+    res, _ = inspect(write("upper.parquet", {"Timestamp": pa.array(np.arange(10) * 0.1)}))
+    check(res.timestamp_column == "Timestamp", "timestamp column found case-insensitively")
+    res, _ = inspect(write("float_ep.parquet", {"timestamp": pa.array(np.arange(10) * 0.1),
+                                                 "episode_index": pa.array(np.zeros(10))}))
+    check(res.episode_column is None, "a float episode_index is not used as an episode column")
+
+    # Degenerate tables
+    res, prof = inspect(write("zero_rows.parquet", {"timestamp": pa.array([], type=pa.float64()),
+                                                     "x": pa.array([], type=pa.float32())}), nan_check=True)
+    check(res.is_parquet and res.num_rows == 0 and res.error is None and prof.duration_s is None
+          and res.frame_rate_hz is None, "zero-row table: schema only, no timing, no error")
+    res, prof = inspect(write("one_row.parquet", {"timestamp": pa.array([1.0]), "x": pa.array([np.nan])}),
+                        nan_check=True)
+    check(res.frame_rate_hz is None and res.episodes["count"] == 1 and prof.duration_s == 0
+          and "nan_values" in findings(prof), "one-row table: no rate, one zero-length episode, NaN still found")
+    res, prof = inspect(write("all_null_ts.parquet", {"timestamp": pa.array([None, None], type=pa.float64())}))
+    check(res.timestamp_column is None and res.frame_rate_hz is None, "all-null timestamp column: no timing")
+    res, prof = inspect(write("some_null_ts.parquet",
+                              {"timestamp": pa.array([0.0, 0.1, None, 0.3, float("nan"), 0.5, 0.6])}))
+    # The 5 valid stamps leave intervals 0.1, 0.2, 0.2, 0.1 s: mean 0.15 s.
+    check("null_timestamps" in findings(prof) and abs(res.frame_rate_hz - 1 / 0.15) < 0.01,
+          f"null and NaN timestamps dropped and reported, rate from the rest: {res.frame_rate_hz:.2f} Hz")
+
+    # Time order
+    rng = np.random.default_rng(0)
+    _, prof = inspect(write("shuffled.parquet", {"timestamp": pa.array(rng.permutation(1000) * 0.01)}))
+    check("timestamps_unsorted" in findings(prof), "shuffled timestamps without episodes: reported as unsorted")
+    _, prof = inspect(write("backstep.parquet", {"timestamp": pa.array([0.0, 0.1, 0.2, 0.15, 0.3, 0.4]),
+                                                 "episode_index": pa.array([0] * 6)}))
+    check("non_monotonic_time" in findings(prof), "time stepping back inside an episode: non_monotonic_time")
+    t = np.arange(10) * 0.1
+    res, prof = inspect(write("interleaved.parquet", {"timestamp": pa.array(np.repeat(t, 2)),
+                                                       "episode_index": pa.array([0, 1] * 10)}))
+    check(res.episodes["count"] == 2 and abs(res.frame_rate_hz - 10) < 0.01
+          and "non_monotonic_time" not in findings(prof),
+          "rows of two episodes interleaved: grouped by episode, 10 Hz, nothing flagged")
+    res, prof = inspect(write("resets.parquet", {"timestamp": pa.array(np.tile(np.arange(50) * 0.02, 3))}))
+    check(res.episodes["count"] == 3 and res.episodes["source"] == "timestamp resets"
+          and abs(res.frame_rate_hz - 50) < 0.01, "no episode column: time resets split episodes")
+
+    # NaN scan over nested lists with nulls at each level
+    nested = pa.array([[[1.0, float("nan")]], [[float("inf")]], None, [[None]], [None]],
+                      type=pa.list_(pa.list_(pa.float64())))
+    res, _ = inspect(write("nested.parquet", {"a": nested}), nan_check=True)
+    check(res.columns[0].nan_count == 2, "NaN/inf counted inside list<list<float>> with nulls")
+    big = write("nan_sampled.parquet", {"x": pa.array(rng.random(200_000))}, row_group_size=10_000)
+    _, prof = inspect(big, nan_check=True, nan_budget_bytes=200_000)
+    check("nan_check_sampled" in findings(prof) and "nan_check_skipped" not in findings(prof),
+          "NaN budget smaller than the float data: scan sampled and labelled")
+
+    # Codecs and dictionary pages: the column range must include the dictionary page
+    p = write("zstd_dict.parquet", {"timestamp": pa.array(np.arange(1000) * 0.01),
+                                    "episode_index": pa.array(np.arange(1000) // 100)},
+              compression="zstd", use_dictionary=True, row_group_size=250)
+    res, _ = inspect(p)
+    check(res.columns[0].compression == "ZSTD" and res.episodes["count"] == 10 and abs(res.frame_rate_hz - 100) < 0.01,
+          "zstd + dictionary-encoded episode column decodes from range reads")
+
+    # Damaged files
+    g = TMP / "garbage_footer.parquet"
+    g.write_bytes(b"PAR1" + np.random.default_rng(2).bytes(200) + (50).to_bytes(4, "little") + b"PAR1")
+    res, prof = inspect(g)
+    check(res.error and "footer" in res.error and "parse_error" in findings(prof),
+          "valid magic, garbage footer: error, not a crash")
+    e = TMP / "encrypted.parquet"
+    e.write_bytes(b"PAR1" + b"\0" * 20 + b"PARE")
+    res, prof = inspect(e)
+    check(res.error and "encrypted" in res.error and "encrypted" in findings(prof), "encrypted footer is named")
+    m = TMP / "magic_only.parquet"
+    m.write_bytes(b"PAR1")
+    res, _ = inspect(m)
+    check(res.error is not None, "4-byte file: error, not a crash")
+    good = lerobot_like().read_bytes()
+    cut = TMP / "cut_tail.parquet"
+    cut.write_bytes(good[:-100])
+    res, prof = inspect(cut)
+    check(not res.is_parquet and "bad_magic" in findings(prof), "tail cut off: rejected by the missing end magic")
+
+
 def main(hub: bool) -> None:
     # 1. LeRobot-style episodes, metadata + timing only
     p = lerobot_like()
@@ -153,6 +267,8 @@ def main(hub: bool) -> None:
     bad.write_bytes(b"PAR1" + b"\x00" * 100)
     res, _ = inspect_parquet(LocalRangeFile(bad))
     check(not res.is_parquet and "truncated" in (res.error or ""), f"truncated file rejected: {res.error}")
+
+    edge_cases()
 
     if not hub:
         return

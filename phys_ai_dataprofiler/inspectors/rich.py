@@ -25,6 +25,7 @@ except ImportError:
 
 try:
     import scipy.io
+    import scipy.sparse
     import numpy as np
     SCIPY_AVAILABLE = True
 except ImportError:
@@ -319,9 +320,11 @@ class RichInspector:
                 dtype = str(value.dtype)
 
                 # Check for NaNs
+                # Sparse matrices: only the stored entries can be NaN (np.isnan rejects the matrix itself).
+                values = value.data if scipy.sparse.issparse(value) else value
                 nan_count = 0
-                if hasattr(value, "dtype") and np.issubdtype(value.dtype, np.floating):
-                    nan_count = int(np.isnan(value).sum())
+                if np.issubdtype(values.dtype, np.floating) or np.issubdtype(values.dtype, np.complexfloating):
+                    nan_count = int(np.count_nonzero(np.isnan(values)))
 
                 channels.append(mat_channel_profile(name, shape, dtype, nan_count))
 

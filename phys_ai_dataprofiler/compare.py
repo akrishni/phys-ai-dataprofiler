@@ -58,7 +58,7 @@ def render_compare_markdown(cands: list[Candidate], req: Requirements) -> str:
     L.append(f"Requirements: `{req.source}`. Ranked best first: fewer required failures, then fewer unknowns, "
              "then more passes, then more hours.")
     L.append("")
-    head = "| | " + " | ".join(f"{i + 1}. `{c.label}`" for i, c in enumerate(cands)) + " |"
+    head = "| | " + " | ".join(f"{i + 1}. `{_cell(c.label)}`" for i, c in enumerate(cands)) + " |"
     L += [head, "|---|" + "---|" * len(cands)]
     L.append("| **Verdict** | " + " | ".join(f"**{BADGE[c.verdict.status]}** "
                                               f"({c.verdict.passed}/{c.verdict.failed}/{c.verdict.unknown})"
@@ -77,7 +77,7 @@ def render_compare_markdown(cands: list[Candidate], req: Requirements) -> str:
         for c in cands:
             ch = next((x for x in c.verdict.checks if x.id == cid), None)
             row.append("-" if ch is None else _cell(f"{BADGE[ch.status]}: {ch.headline or ch.observed}"))
-        L.append(f"| {label}{' (optional)' if opt else ''} | " + " | ".join(row) + " |")
+        L.append(f"| {_cell(label)}{' (optional)' if opt else ''} | " + " | ".join(row) + " |")
     L.append("")
     L.append("Cells show status and what was found. (n/n/n) is passed/failed/unknown checks.")
     from phys_ai_dataprofiler import __version__

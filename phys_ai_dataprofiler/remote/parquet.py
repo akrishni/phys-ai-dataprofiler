@@ -318,6 +318,7 @@ def _read_columns(rf: RangeFile, md, leaves: list[int], rgs: list[int], workers:
 # --------------------------------------------------------------------------- #
 
 _UNIT_NS = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000, "ns": 1}
+_EPOCH_S = (946_684_800, 4_102_444_800)   # 2000-01-01 .. 2100-01-01 in Unix seconds
 
 
 def _to_ns(arr) -> tuple[np.ndarray | None, str | None, np.ndarray | None]:
@@ -342,19 +343,23 @@ def _to_ns(arr) -> tuple[np.ndarray | None, str | None, np.ndarray | None]:
             vv = fv[valid]
         if not valid.any():
             return None, None, None
-        m = float(np.max(np.abs(vv)))
+        lo, m = float(np.min(vv)), float(np.max(np.abs(vv)))
+        d = np.diff(vv)
+        step = float(np.median(d[d > 0])) if (d > 0).any() else 1.0
+        # Epoch timestamps (years 2000-2100, steps under an hour) give the unit away by magnitude.
+        # Relative integer time does not (ns since start passes 1e9 after one second), so its
+        # unit comes from the step size.
+        epoch = next((u for u, scale in _UNIT_NS.items()
+                      if _EPOCH_S[0] * 1e9 / scale <= lo and m <= _EPOCH_S[1] * 1e9 / scale
+                      and step * scale <= 3600e9), None)
         if m >= 1e17:
             unit = "ns"
-        elif m >= 1e14:
-            unit = "us"
-        elif m >= 1e11:
-            unit = "ms"
-        elif not is_int or m >= 1e8:
-            unit = "s"          # float seconds (LeRobot) or integer epoch seconds
-        else:                   # small integers: relative time; infer unit from step size
-            d = np.diff(vv)
-            md = float(np.median(d[d > 0])) if (d > 0).any() else 1.0
-            unit = "ns" if md >= 1e6 else "us" if md >= 1e3 else "ms"
+        elif epoch:
+            unit = epoch
+        elif not is_int:
+            unit = "us" if m >= 1e14 else "ms" if m >= 1e11 else "s"   # float seconds (LeRobot) unless huge
+        else:                   # relative integer time; infer unit from step size
+            unit = "ns" if step >= 1e6 else "us" if step >= 1e3 else "ms"
         if is_int:
             return v * _UNIT_NS[unit], unit, valid
         ns = np.where(valid, fv, 0.0) * _UNIT_NS[unit]

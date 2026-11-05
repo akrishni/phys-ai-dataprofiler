@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from phys_ai_dataprofiler.compare import compare_reports, render_compare_markdown  # noqa: E402
-from phys_ai_dataprofiler.evaluate import FAIL, PASS, UNKNOWN, compare, evaluate  # noqa: E402
+from phys_ai_dataprofiler.evaluate import (  # noqa: E402
+    FAIL, PASS, UNKNOWN, compare, evaluate, render_verdict_markdown, verdict_to_dict)
 from phys_ai_dataprofiler.requirements import (  # noqa: E402
     RequirementsError, list_presets, load_requirements, parse_requirements)
 
@@ -305,12 +306,174 @@ def test_cli() -> None:
     check(r.returncode == 2, "compare needs two targets")
 
 
+def test_parsing_edges() -> None:
+    for doc in ([], None, "streams", 3):
+        try:
+            parse_requirements(doc, "t.yaml")
+            check(False, f"top-level {type(doc).__name__} rejected")
+        except RequirementsError as exc:
+            check("mapping at the top level" in str(exc), f"top-level {type(doc).__name__} rejected")
+    S = {"name": "s", "match": {"topic": "*"}}
+    cases = [
+        ({"streams": "cam"}, "expected a list"),
+        ({"streams": ["cam"]}, "expected a mapping"),
+        ({"files": ["a/*"], "streams": [S]}, "include and/or exclude"),
+        ({"files": {"exlude": "b"}, "streams": [S]}, "did you mean 'exclude'"),
+        ({"streams": [{"name": "s", "match": {"topic": []}}]}, "pattern or a list of patterns"),
+        ({"streams": [{"name": "s", "match": {"topic": ""}}]}, "pattern or a list of patterns"),
+        ({"streams": [{"name": "", "match": {"topic": "*"}}]}, "name: required"),
+        ({"streams": [{**S, "min_count": 0}]}, "1 or more"),
+        ({"streams": [{**S, "min_count": "some"}]}, "whole number"),
+        ({"streams": [{**S, "coverage": 0}]}, "above 0"),
+        ({"streams": [{**S, "coverage": 1.5}]}, "at most 1"),
+        ({"streams": [{**S, "max_gaps": 2.5}]}, "whole number"),
+        ({"streams": [{**S, "min_rate_hz": True}]}, "expected a number"),
+        ({"streams": [{**S, "min_rate_hz": -1}]}, "0 or more"),
+        ({"streams": [{**S, "required": "yes"}]}, "true or false"),
+        ({"streams": [{"name": "s", "match": {"topic": "*", "min_rate_hz": 3}}]}, "belongs under the stream entry"),
+        ({"dataset": {"min_episodes": 3, "match": {}}}, "belongs under a stream entry"),
+        ({"dataset": {"max_short_episodes_pct": 10}}, "together with min_episode_seconds"),
+        ({"dataset": {"same_schema_across_files": "yes"}}, "true or false"),
+        ({"dataset": {"same_schema_across_files": False}}, "no requirements"),
+        ({"dataset": "lots"}, "expected a mapping"),
+        ({"name": 5, "streams": [S]}, "expected text"),
+        ({"codec": "h264", "streams": [S]}, "not supported"),
+    ]
+    for doc, want in cases:
+        e = errors_of(doc)
+        check(any(want in x for x in e), f"rejected with '{want}': {str(doc)[:60]}")
+
+    ok = parse_requirements({"streams": [{**S, "min_count": 2.0, "min_rate_hz": 10, "max_rate_hz": 10,
+                                          "match": {"modality": "VIDEO"}}]}, "/some/dir/my-policy.yaml")
+    s = ok.streams[0]
+    check(s.min_count == 2 and isinstance(s.min_count, int), "min_count 2.0 is accepted as the integer 2")
+    check(s.match.modality == ["video"], "modality is case-insensitive")
+    check(ok.name == "my-policy", "name falls back to the file stem")
+    check(parse_requirements({"streams": [S]}, "preset:abc").name == "abc", "name falls back to the preset name")
+
+    for spec, want in (("nofile", "built-in presets"), ("nofile.yaml", "file not found"), ("preset:", "no preset named ''"),
+                       ("preset:../presets/teleop-imitation", "no preset named"), ("preset:visual", "visual-odometry")):
+        try:
+            load_requirements(spec)
+            check(False, f"load_requirements({spec!r}) raises")
+        except RequirementsError as exc:
+            check(want in str(exc), f"load_requirements({spec!r}): {want}")
+    empty = TMP / "empty.yaml"
+    empty.write_text("")
+    try:
+        load_requirements(str(empty))
+        check(False, "empty YAML file raises")
+    except RequirementsError as exc:
+        check("mapping" in str(exc), "empty YAML file rejected as not a mapping")
+
+
+def test_evaluate_edges() -> None:
+    one = report([file("a.mcap", [ch("/cam", "video", rate=None, count=1)])])
+    v = evaluate(one, parse_requirements({"streams": [CAM]}, "t"))
+    check(v.status == UNKNOWN and "fewer than two messages" in v.checks[0].evidence[0],
+          "single-message stream: rate unknown, says why")
+    fast = report([file("a.mcap", [ch("/cam", "video", rate=60, jitter=5, gap=40)])])
+    check(status(fast, {"streams": [{**CAM, "max_rate_hz": 40}]}) == FAIL, "max_rate_hz exceeded fails")
+    check(status(fast, {"streams": [{"name": "j", "match": {"topic": "*"}, "max_jitter_ms": 2}]}) == FAIL,
+          "max_jitter_ms exceeded fails")
+    check(status(fast, {"streams": [{"name": "j", "match": {"topic": "*"}, "max_jitter_ms": 10}]}) == PASS,
+          "max_jitter_ms met passes")
+
+    # Sampled timing, zero-limit gap counts: an estimate of 0 cannot prove 0, an estimate of 1 proves > 0.
+    js = {"name": "js", "match": {"modality": "proprio"}, "max_gaps": 0}
+    smp0 = report([file("a.bag", [ch("/js", "proprio", rate=100, gap=12, gaps=0)], findings=["sampled_message_index"])])
+    smp1 = report([file("a.bag", [ch("/js", "proprio", rate=100, gap=500, gaps=1)], findings=["sampled_message_index"])])
+    check(status(smp0, {"streams": [js]}) == UNKNOWN, "sampled: no gaps seen is unknown for max_gaps 0")
+    check(status(smp1, {"streams": [js]}) == FAIL, "sampled: a gap seen fails max_gaps 0")
+
+    skipped = report([file("a.parquet", [ch("x", "proprio")], fmt="parquet", findings=["nan_check_skipped"])])
+    v = evaluate(skipped, parse_requirements({"streams": [{"name": "f", "match": {"topic": "*"}, "max_nan": 0}]}, "t"))
+    check(v.status == UNKNOWN and "nan-budget-mb" in (v.checks[0].resolve or ""), "NaN scan off: unknown, how to fix")
+
+    js_schema = report([file("a.mcap", [ch("/js", schema="sensor_msgs/JointState")])])
+    check(status(js_schema, {"streams": [{"name": "j", "match": {"schema": "*jointstate"}}]}) == PASS,
+          "schema glob is case-insensitive")
+    check(status(js_schema, {"streams": [{"name": "j", "match": {"topic": "/JS"}}]}) == PASS,
+          "topic glob is case-insensitive")
+
+    two = report([file("data/a.mcap", [ch("/cam", "video", rate=30)]), file("meta/b.mcap", [])])
+    check(status(two, {"files": {"include": "data/*"}, "streams": [CAM]}) == PASS, "files.include narrows scope")
+    v = evaluate(two, parse_requirements({"files": {"include": "nothing/*"}, "streams": [CAM]}, "t"))
+    check(v.status == UNKNOWN and "2 excluded" in v.notes[0], "nothing in scope: unknown, says how many were excluded")
+
+    unk_opt = report([file("a.mcap", [ch("/imu", "imu", rate=200)], findings=["unknown_channels"])])
+    v = evaluate(unk_opt, parse_requirements({"streams": [{**CAM, "required": False},
+                                                          {"name": "imu", "match": {"modality": "imu"}}]}, "t"))
+    check(v.status == PASS and v.checks[0].status == UNKNOWN, "optional unknown does not change the overall result")
+
+    good = [file(f"{i}.mcap", [ch("/cam", "video", rate=30)]) for i in range(8)]
+    r = report(good + [file("x.mcap", [], valid=False, error="e"), file("y.mcap", [ch("/cam", "video", rate=5)])])
+    check(status(r, {"streams": [{**CAM, "coverage": 0.9}]}) == UNKNOWN,
+          "coverage 0.9: 8 pass, 1 unreadable, 1 fail is unknown (depends on the unreadable file)")
+    r = report(good + [file("x.mcap", [ch("/cam", "video", rate=5)]), file("y.mcap", [ch("/cam", "video", rate=5)])])
+    check(status(r, {"streams": [{**CAM, "coverage": 0.9}]}) == FAIL, "coverage 0.9: 8 of 10 fails")
+
+    many = report([file(f"{i}.mcap", [ch("/cam", "video", rate=5)]) for i in range(8)])
+    ev = evaluate(many, parse_requirements({"streams": [CAM]}, "t")).checks[0].evidence
+    check(sum(e.startswith("FAIL") for e in ev) == 5 and any("3 more file(s)" in e for e in ev),
+          "evidence lists 5 failing files and counts the rest")
+
+    pipes = report([file("a.mcap", [ch("/cam", "video", rate=30)])])
+    v = evaluate(pipes, parse_requirements({"streams": [{"name": "c", "match": {"topic": ["/a", "/cam"]}}]}, "t"))
+    row = next(line for line in render_verdict_markdown(v).splitlines() if line.startswith("| c "))
+    check(row.count("|") == 6, "glob alternatives (a|b) do not break the Markdown table")
+    d = json.loads(json.dumps(verdict_to_dict(v)))
+    check(d["exit_code"] == 0 and d["status"] == "pass", "verdict round-trips through JSON with its exit code")
+
+    # Reports from older versions or failed files: missing or null sections must not raise.
+    sparse = {"repo_id": "x", "files": [{"repo_path": "a.mcap", "valid": True, "rich": None}, {"repo_path": "b.mcap"}]}
+    v = evaluate(sparse, parse_requirements({"streams": [CAM], "dataset": {"min_total_hours": 1,
+                                             "same_schema_across_files": True, "max_invalid_files_pct": 50}}, "t"))
+    check(v.status == UNKNOWN and len(v.checks) == 4, "report with null rich and missing fields: unknown, no crash")
+
+    timeless = report([file("a.mcap", [ch("/x")], duration=None), file("b.mcap", [ch("/x")], duration=600)])
+    for key, val in (("min_total_hours", 1), ("min_episodes", 5), ("min_episode_seconds", 700)):
+        check(status(timeless, {"dataset": {key: val}}, f"dataset:{key}") == UNKNOWN,
+              f"{key} short because a file has no time range: unknown")
+    check(status(report([]), {"dataset": {"max_invalid_files_pct": 0}}) == UNKNOWN, "no files at all: unknown")
+    check(status(report([file("a.mcap", [])]), {"dataset": {"same_schema_across_files": True}}) == UNKNOWN,
+          "same_schema with no streams read: unknown")
+    check(status(report([file("a.bag", [ch("/js", schema="A")]), file("b.bag", [], valid=False, error="x")]),
+                 {"dataset": {"same_schema_across_files": True}}) == UNKNOWN,
+          "same_schema with an unreadable file: unknown, not pass")
+    no_min = report([file("c.parquet", [ch("s", "proprio")], fmt="parquet",
+                          basic={"episodes": {"count": 3, "complete": True, "seconds_min": None}})])
+    check(status(no_min, {"dataset": {"min_episode_seconds": 4}}) == UNKNOWN,
+          "Parquet episodes without seconds_min: unknown, no crash")
+
+
+def test_compare_edges() -> None:
+    req = parse_requirements({"streams": [CAM]}, "t")
+    a = report([file("a.mcap", [ch("/cam", "video", rate=30)], duration=3600)], repo="org/a")
+    b = report([file("a.mcap", [ch("/cam", "video", rate=30)], duration=7200)], repo="org/b")
+    empty = {"repo_id": "org/none", "files": [], "totals": {}, "files_skipped": []}
+    ranked = compare_reports([("a", a), ("none", empty), ("b", b)], req)
+    check([c.label for c in ranked] == ["b", "a", "none"], "equal verdicts rank by hours; a failed profile ranks last")
+    tie = compare_reports([("x", a), ("y", a)], req)
+    check([c.label for c in tie] == ["x", "y"], "exact ties keep the input order")
+    piped = parse_requirements({"streams": [{**CAM, "name": "cam|front"}]}, "t")
+    md = render_compare_markdown(compare_reports([("a|1", a), ("b", b)], piped), piped)
+    rows = [line for line in md.splitlines() if line.startswith("| ")]
+    check(all(r.count("|") == 4 for r in rows), "labels and stream names containing | do not add table columns")
+    v = evaluate(a, piped)
+    row = next(line for line in render_verdict_markdown(v).splitlines() if line.startswith("| cam"))
+    check(row.count("|") == 6, "a stream name containing | does not break the verdict table")
+
+
 def main() -> None:
     test_parsing()
+    test_parsing_edges()
     test_compare_margin()
     test_streams()
+    test_evaluate_edges()
     test_dataset()
     test_compare()
+    test_compare_edges()
     test_cli()
     print("all checks passed")
 

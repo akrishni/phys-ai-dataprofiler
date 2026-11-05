@@ -534,7 +534,7 @@ def render_verdict_markdown(v: Verdict, level: int = 2) -> str:
     L.append("| Check | Status | Required | Expected | Observed |")
     L.append("|---|---|---|---|---|")
     for c in v.checks:
-        L.append(f"| {c.label} | {BADGE[c.status]} | {'yes' if c.required else 'no'} | "
+        L.append(f"| {c.label.replace('|', '/')} | {BADGE[c.status]} | {'yes' if c.required else 'no'} | "
                  f"{c.expected.replace('|', '/')} | {c.observed.replace('|', '/')} |")
     L.append("")
     for c in v.checks:

@@ -234,9 +234,60 @@ def main() -> None:
     check(res.error and not res.is_bag, "bag2: unrelated SQLite file is rejected")
     check(sniff_format(LocalRangeFile(other), "data.db3") == "unknown", "bag2: unrelated SQLite not sniffed as bag")
 
+    edge_cases()
+
     if "--hub" in sys.argv:
         hub()
     print("all checks passed")
+
+
+def tiny_bag(kind: int, name: str, msgs: list[tuple[int, int]], topics=TOPICS) -> Path:
+    """Bag with the given (connection index, timestamp) messages written in that order."""
+    if kind == 1:
+        path = TMP / f"{name}.bag"
+        with Writer1(path) as w:
+            conns = [w.add_connection(t, ty, typestore=TS1) for t, ty in topics]
+            for i, t in msgs:
+                w.write(conns[i], t, b"x" * 10)
+        return path
+    d = TMP / name
+    if d.exists():
+        shutil.rmtree(d)
+    with Writer2(d, version=9) as w:
+        conns = [w.add_connection(t, ty, typestore=TS2) for t, ty in topics]
+        for i, t in msgs:
+            w.write(conns[i], t, b"x" * 10)
+    return next(d.glob("*.db3"))
+
+
+def edge_cases() -> None:
+    t0, ms = 1_700_000_000_000_000_000, 10_000_000
+    for kind, fn in ((1, inspect_bag1_remote), (2, inspect_bag2_remote)):
+        tag = f"bag{kind}"
+        res, prof, _ = run(fn, tiny_bag(kind, f"{tag}_empty", []))
+        check(res.error is None and not prof.channels and res.message_count == 0,
+              f"{tag} with connections but no messages: no streams, no error")
+
+        p = tiny_bag(kind, f"{tag}_one", [(0, t0)])
+        res, prof, _ = run(fn, p)
+        check(stats(prof) == reference(p) == {"/imu": (1, 0, 0, 0)} and res.duration_s == 0,
+              f"{tag} with one message: count 1, no rate, zero duration")
+
+        p = tiny_bag(kind, f"{tag}_silent", [(0, t0 + k * ms) for k in range(50)])
+        res, prof, _ = run(fn, p)
+        check(stats(prof) == reference(p) and [c.topic for c in prof.channels] == ["/imu"],
+              f"{tag}: a connection with no messages is not listed as a stream")
+
+        p = tiny_bag(kind, f"{tag}_ooo", [(0, t0 + k * ms) for k in (3, 1, 2, 0, 4)])
+        res, prof, _ = run(fn, p)
+        check(stats(prof) == reference(p) == {"/imu": (5, 100.0, 0, 10.0)},
+              f"{tag} written out of time order: same stats as a full read, no negative intervals")
+
+    for label, data in (("header only", b"#ROSBAG V2.0\n"), ("garbage after magic", b"#ROSBAG V2.0\n" + b"\xff" * 64)):
+        p = TMP / f"{label.replace(' ', '_')}.bag"
+        p.write_bytes(data)
+        res, prof, _ = run(inspect_bag1_remote, p)
+        check(res.error and "parse_error" in findings(prof), f"bag1 {label}: error reported, not raised")
 
 
 def hub() -> None:

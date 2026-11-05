@@ -141,6 +141,100 @@ def main() -> None:
         _, prof = inspect_mat_remote(LocalRangeFile(path), nan_budget_bytes=0)
         check("nan_check_skipped" in findings(prof), "MAT NaN scan can be disabled")
 
+    mcap_edge_cases()
+    mat_edge_cases()
+
+
+def tiny_mcap(name: str, messages: list[tuple[int, int]], topics=("/a",)) -> Path:
+    """MCAP with the given (channel index, log_time) messages, written in that order."""
+    path = TMP / f"{name}.mcap"
+    with path.open("wb") as f:
+        w = Writer(f)
+        w.start("test", "test")
+        s = w.register_schema("S", "jsonschema", b"{}")
+        ids = [w.register_channel(t, "json", s) for t in topics]
+        for ci, t in messages:
+            w.add_message(ids[ci], log_time=t, publish_time=t, data=b"{}")
+        w.finish()
+    return path
+
+
+def mcap_edge_cases() -> None:
+    ms = 10_000_000
+    cases = [
+        ("no messages", tiny_mcap("empty", []), {}),
+        ("one message", tiny_mcap("one", [(0, 5)]), {"/a": (1, 0, 0, 0)}),
+        # /b is registered but never written to: it must not appear as a 0-message stream with a rate
+        ("silent channel", tiny_mcap("silent", [(0, k * ms) for k in range(100)], ("/a", "/b")),
+         {"/a": (100, 100.0, 0, 10.0)}),
+        # written out of time order: intervals come from sorted timestamps, never negative
+        ("out of order", tiny_mcap("ooo", [(0, k * ms) for k in (3, 1, 2, 0, 4)]), {"/a": (5, 100.0, 0, 10.0)}),
+    ]
+    for label, path, want in cases:
+        res, prof, _ = remote(path)
+        full = stats(RichInspector(str(path)).inspect())
+        check(res.error is None and stats(prof) == want == full, f"MCAP {label}: {stats(prof)} equals full read")
+    _, prof, _ = remote(cases[0][1])
+    check(prof.duration_s is None and not prof.channels, "MCAP with no messages: no duration, no streams")
+
+    # Starts more than 1 s apart are reported; within a second they are not.
+    late = tiny_mcap("late", [(0, k * ms) for k in range(10)] + [(1, 3_000_000_000 + k * ms) for k in range(10)],
+                     ("/a", "/b"))
+    _, prof, _ = remote(late)
+    check("start_offset" in findings(prof), "a stream starting 3 s after the first: start_offset")
+    check("start_offset" not in findings(remote(cases[2][1])[1]), "streams starting together: no start_offset")
+
+    junk = TMP / "junk.mcap"
+    junk.write_bytes(np.random.default_rng(3).bytes(500))
+    res, prof, _ = remote(junk)
+    check(not res.is_mcap and "bad_magic" in findings(prof), "random bytes named .mcap: rejected, not parsed")
+
+
+def mat_edge_cases() -> None:
+    import scipy.sparse
+
+    path = TMP / "types.mat"
+    scipy.io.savemat(path, {
+        "st": {"a": np.array([np.nan]), "b": 2},          # NaN inside a struct: not scanned
+        "cl": np.array([1, "x"], dtype=object),
+        "sp": scipy.sparse.csr_matrix(np.array([[np.nan, 0], [0, 1.0]])),
+        "cx": np.array([1 + np.nan * 1j, 2]),
+        "empty": np.zeros((0, 3)),
+        "txt": "hello",
+        "allnan": np.full(10, np.nan),
+        "flags": np.array([True, False]),
+    })
+    # The full-read inspector used to raise on the sparse matrix (np.isnan on a scipy sparse object).
+    local = RichInspector(str(path)).inspect()
+    local_nan = {c.topic: c.nan_count for c in local.channels}
+    check(local_nan["sp"] == 1 and local_nan["cx"] == 1 and local_nan["allnan"] == 10,
+          f"full read handles sparse, complex and all-NaN variables: {local_nan}")
+    res, prof = inspect_mat_remote(LocalRangeFile(path))
+    got = {c.topic: (c.schema, c.nan_count) for c in prof.channels}
+    check(res.error is None and len(got) == 8, f"remote MAT lists every variable type: {sorted(got)}")
+    check(got["st"][0] == "struct" and got["cl"][0] == "cell" and got["sp"][0] == "sparse",
+          "struct, cell and sparse are named as such")
+    check(got["cx"][1] == 1 and got["allnan"][1] == 10 and got["empty"][1] == 0,
+          "complex NaN counted, all-NaN counted, empty array is 0")
+
+    raw = path.read_bytes()
+    cut = TMP / "types_cut.mat"
+    cut.write_bytes(raw[:-20])
+    res, prof = inspect_mat_remote(LocalRangeFile(cut))
+    check(res.error is None and "truncated" in findings(prof) and len(res.variable_names) == 7,
+          f"truncated MAT: earlier variables kept, last one reported truncated ({res.variable_names})")
+
+    empty = TMP / "no_vars.mat"
+    scipy.io.savemat(empty, {})
+    res, prof = inspect_mat_remote(LocalRangeFile(empty))
+    check(res.is_matfile and res.error is None and not prof.channels and not prof.findings,
+          "MAT with no variables: valid, empty")
+
+    v4 = TMP / "v4.mat"
+    scipy.io.savemat(v4, {"a": np.ones(3)}, format="4")
+    res, prof = inspect_mat_remote(LocalRangeFile(v4))
+    check(res.error and "unsupported" in findings(prof), "MAT v4 is reported unsupported, not misparsed")
+
 
 if __name__ == "__main__":
     main()
