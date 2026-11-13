@@ -9,7 +9,7 @@ description = "Profile robotics and lab datasets on the Hugging Face Hub without
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Anand Krishniyer", email = "akrishniyer@gmail.com" }]
+authors = [{ name = "Anand Krishniyer" }, { email = "akrishniyer@gmail.com" }]   # separate entries so Author is set
 requires-python = ">=3.10"
 keywords = ["robotics", "dataset", "mcap", "rosbag", "ros2", "matlab", "parquet", "lerobot",
             "huggingface", "data-quality", "profiling"]
