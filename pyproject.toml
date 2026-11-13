@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "phys-ai-dataprofiler"
 dynamic = ["version"]
-description = "Profile robotics and lab datasets on the Hugging Face Hub without downloading them (MCAP, ROS bags, MATLAB, Parquet), and check them against your requirements"
+description = "Profile robotics and lab datasets on the Hugging Face Hub without downloading them (MCAP, ROS bags, MATLAB, Parquet, LeRobot video), and check them against your requirements"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Anand Krishniyer" }, { email = "akrishniyer@gmail.com" }]   # separate entries so Author is set
 requires-python = ">=3.10"
-keywords = ["robotics", "dataset", "mcap", "rosbag", "ros2", "matlab", "parquet", "lerobot",
+keywords = ["robotics", "dataset", "mcap", "rosbag", "ros2", "matlab", "parquet", "lerobot", "mp4",
             "huggingface", "data-quality", "profiling"]
 classifiers = [
     "Development Status :: 4 - Beta",

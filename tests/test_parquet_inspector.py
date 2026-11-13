@@ -169,6 +169,30 @@ def edge_cases() -> None:
     check("nan_check_sampled" in findings(prof) and "nan_check_skipped" not in findings(prof),
           "NaN budget smaller than the float data: scan sampled and labelled")
 
+    # One row group holding more float data than the budget (DROID: 100 MB per file, one row group):
+    # whole columns are scanned, smallest first, instead of reading the entire file.
+    one_rg = write("nan_one_rg.parquet", {"small": pa.array(rng.random(20_000)),
+                                          "large": pa.array([list(r) for r in rng.random((20_000, 8))]),
+                                          "timestamp": pa.array(np.arange(20_000) * 0.01)}, row_group_size=20_000)
+    rf = LocalRangeFile(one_rg)
+    res, prof = inspect_parquet(rf, nan_check=True, nan_budget_bytes=400_000)
+    by = {c.name: c.nan_count for c in res.columns}
+    check("nan_check_partial" in findings(prof) and by["small"] == 0 and by["large"] is None
+          and rf.bytes_fetched < 0.5 * rf.size,
+          f"one oversized row group: small float columns scanned, the large one left out "
+          f"({rf.bytes_fetched} of {rf.size} B)")
+
+    # Modalities: numeric columns named after a camera are calibration, not frames (DROID camera_extrinsics)
+    res, prof = inspect(write("cams.parquet", {
+        "camera_extrinsics.wrist": pa.array([[0.0] * 6] * 4), "camera_pose": pa.array([[0.0] * 7] * 4),
+        "observation.images.top": pa.array([{"bytes": b"x", "path": "a.png"}] * 4),
+        "observation.image": pa.array([[0] * 12] * 4, type=pa.list_(pa.uint8())),
+        "camera_jpeg": pa.array([b"x"] * 4)}))
+    mod = {c.topic: c.modality for c in prof.channels}
+    check(mod == {"camera_extrinsics.wrist": "data", "camera_pose": "proprio", "observation.images.top": "image",
+                  "observation.image": "image", "camera_jpeg": "image"},
+          f"camera calibration columns are not cameras; encoded and pixel image columns are: {mod}")
+
     # Codecs and dictionary pages: the column range must include the dictionary page
     p = write("zstd_dict.parquet", {"timestamp": pa.array(np.arange(1000) * 0.01),
                                     "episode_index": pa.array(np.arange(1000) // 100)},

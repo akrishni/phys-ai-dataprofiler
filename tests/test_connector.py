@@ -70,6 +70,16 @@ def test_select_files() -> None:
     sel, skipped = HuggingFaceConnector.select_files(files, explicit=["d/e.mat"], max_file_bytes=10)
     check(not sel and reasons(skipped) == {"d/e.mat": "exceeds --max-file-mb"},
           "size limits still apply to explicit files, and they are not also reported missing")
+    lerobot = [RemoteFile(f"data/chunk-000/file-{i:03d}.parquet", 10, None) for i in range(5)] + [
+        RemoteFile(f"videos/observation.images.{cam}/chunk-000/file-{i:03d}.mp4", 10, None)
+        for cam in ("top", "wrist") for i in range(5)]
+    sel, _ = HuggingFaceConnector.select_files(lerobot, extensions=["parquet", "mp4"], max_files=3)
+    check([f.path for f in sel] == ["data/chunk-000/file-000.parquet",
+                                    "videos/observation.images.top/chunk-000/file-000.mp4",
+                                    "videos/observation.images.wrist/chunk-000/file-000.mp4"],
+          f"--max-files on a LeRobot repo takes a table and each camera, not just the tables: {[f.path for f in sel]}")
+    sel, _ = HuggingFaceConnector.select_files(lerobot, extensions=["parquet", "mp4"], max_files=4)
+    check(sum(f.path.startswith("data/") for f in sel) == 2 and len(sel) == 4, "kinds take turns past one round")
     sel, skipped = HuggingFaceConnector.select_files([], extensions=["mcap"])
     check(sel == [] and skipped == [], "empty repo: nothing selected, nothing skipped")
 

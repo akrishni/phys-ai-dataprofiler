@@ -6,8 +6,9 @@ Profile physical-AI and lab datasets on the Hugging Face Hub **without downloadi
 them against what your model needs.
 
 It reads only the bytes that hold metadata (headers, indexes, footers) through HTTP range requests, and
-reports streams, message counts, rates, jitter, gaps, episodes,
-NaN counts and problems such as truncated or unindexed recordings. A requirements file turns that into a
+reports streams, message counts, rates, jitter, gaps, episodes, NaN counts, and problems such as
+truncated or unindexed recordings. LeRobot datasets are covered as a whole: state and actions from the
+Parquet tables, each camera from its MP4s. A requirements file turns that into a
 pass / fail / unknown verdict, and `compare` ranks candidate datasets side by side.
 
 | Format | What is read |
@@ -17,9 +18,10 @@ pass / fail / unknown verdict, and `compare` ranks candidate datasets side by si
 | ROS 2 bag (SQLite `.db3`) | schema, topics, metadata and the leaf pages of the messages table |
 | MATLAB `.mat` (v5, v7, v7.3) | header and each variable's header; float data within a NaN budget |
 | Parquet / LeRobot | footer, column statistics, timestamp and episode columns |
+| MP4 / LeRobot videos | the `moov` index: codec, resolution, per-frame timestamps, keyframes; frames are never decoded |
 
 On large files that is usually well under 1%: a 5.8 GB ROS 1 bag is profiled from 533 KB, a 2.4 GB MAT v7.3
-file from 232 KB. Small files cost proportionally more, because headers and indexes have a minimum size and
+file from 232 KB, a 493 MB camera video from 444 KB. Small files cost proportionally more, because headers and indexes have a minimum size and
 the NaN scan reads float data up to `--nan-budget-mb` (default 32 MB per file): a 659 KB LeRobot file is
 read in full. All figures in this README were measured with default settings.
 
@@ -116,11 +118,12 @@ If a time column is present (`timestamp`, `log_time`, `time`, ...), it also read
 `episode_index` when present (the LeRobot convention). Their byte ranges are known from the footer, so the cost
 is computed up front and capped by `--column-budget-mb` (default 16); beyond that, row groups are sampled and
 the report says so. From these it derives frame rate, jitter, gaps, episode count and lengths, and flags
-dropped frames, short episodes and non-monotonic time. Image, text and state columns are never read.
+dropped frames, short episodes and non-monotonic time. Image and text columns are never read.
 
 Units are inferred: float seconds (LeRobot), integer epoch s/ms/us/ns, and Arrow timestamp types.
 NaN/inf counts are not in Parquet statistics, so float columns are read too, capped by `--nan-budget-mb`
-(default 32); beyond that, row groups are sampled and the report says so. `--nan-budget-mb 0` turns this off.
+(default 32); beyond that, row groups are sampled, or for a file stored as one row group the smallest float
+columns are scanned whole and the rest left out, and the report says so. `--nan-budget-mb 0` turns this off.
 
 | Dataset | Result | Read |
 |---|---|---|
@@ -131,17 +134,46 @@ NaN/inf counts are not in Parquet statistics, so float columns are read too, cap
 `pusht` is small and almost all float state and action columns, so the default NaN scan reads all of it.
 On a dataset of that size the full read is cheap; the budget only limits the cost on large files.
 
+## Video (MP4) support
+
+LeRobot stores each camera as MP4 files next to the Parquet tables, `videos/<camera>/chunk-000/file-000.mp4`
+(v3) or `videos/chunk-000/<camera>/episode_000000.mp4` (v2). An MP4 keeps its index in one `moov` box, at
+the start or the end of the file. The profiler finds it from the 8-byte box headers, skipping the frame
+data, and reads only the boxes that give the codec, resolution, timescale, every frame's duration and
+the keyframes; the per-frame size and offset tables are skipped too. Frames are never decoded. Fragmented
+MP4 is walked one `moof` at a time within `--msgidx-budget-mb`.
+
+Each camera becomes a `video` stream named after its folder (`observation.images.wrist`), with frame
+count, rate, jitter and gaps, so `match: {modality: video, topic: "*wrist*"}` works as it does for a
+ROS image topic. When the repo has a LeRobot `meta/info.json`, each video is checked against the fps,
+resolution and codec it declares. A file whose index was never written (recording cut off) is reported
+`no_moov`; one cut off after the index is reported `truncated`.
+
+In a requirements check, LeRobot cameras are judged on the videos and state and actions on the tables,
+and hours are counted once, not once per camera; see [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).
+With `--max-files N`, the sample takes files from the tables and from every camera in turn.
+
+| Dataset | Result | Read |
+|---|---|---|
+| `lerobot/droid_1.0.1` `exterior_1_left` (v3) | 96,183 frames at 15 Hz, 320x180 AV1, 6,412 s | 444 KB of 493 MB (0.09%) |
+| `lerobot/aloha_sim_insertion_human` `top` (v3) | 25,000 frames at 50 Hz, 640x480 AV1, 500 s | 238 KB of 84 MB (0.28%) |
+| `lerobot/pusht` `observation.image` (v3) | 25,650 frames at 10 Hz, 96x96 AV1, matching `meta/info.json` and ffprobe | 201 KB of 6.6 MB (3%) |
+
+Frame timestamps are the container's timeline as the encoder wrote it. Most recorders, LeRobot included,
+encode at a fixed rate, so a frame dropped at capture time shows as a gap only if the writer kept real
+capture timestamps; the Parquet `timestamp` column is the better check for capture gaps.
+
 ## Usage
 
 ```bash
-# Choose files: by glob, count, size, or exact path
+# Choose files: by glob, count, size, or exact path (--ext .parquet to skip videos)
 phys-ai-dataprofiler org/dataset --include "episodes/*.mcap" --max-files 5
 phys-ai-dataprofiler org/dataset --max-file-mb 500 --max-total-mb 5000
 phys-ai-dataprofiler org/dataset --file logs/run1.mcap --file calib/cam.mat
 
 # Read budgets per file (beyond them, data is sampled and the report says so)
 phys-ai-dataprofiler org/dataset --nan-budget-mb 256        # float data scanned for NaNs; 0 turns it off
-phys-ai-dataprofiler org/dataset --msgidx-budget-mb 128     # MCAP / ROS 1 message-index bytes
+phys-ai-dataprofiler org/dataset --msgidx-budget-mb 128     # MCAP / ROS 1 message indexes, MP4 fragments
 phys-ai-dataprofiler org/dataset --column-budget-mb 64      # Parquet time and episode columns
 
 # Fetch small files whole, or download everything
@@ -204,7 +236,7 @@ phys_ai_dataprofiler/
   cli.py                      check, compare, requirements subcommands
   requirements.py evaluate.py compare.py   requirements files, verdicts, comparisons
   presets/                    built-in requirements files
-  remote/                     byte-range readers: MCAP, MAT, Parquet, ROS bags
+  remote/                     byte-range readers: MCAP, MAT, Parquet, ROS bags, MP4
   inspectors/                 full-read inspectors for local files
 tests/  samples/  scripts/  docs/
 ```

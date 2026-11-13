@@ -11,8 +11,9 @@ Two modes:
   remote   (default) Nothing is downloaded. Files are read through HTTP Range
            requests and only the bytes that hold metadata are fetched: the
            MCAP header, footer, summary and message indexes; the MAT header
-           and per-variable headers. Well under 1% of a large file; small files
-           and float data scanned for NaNs (--nan-budget-mb) cost more.
+           and per-variable headers; the Parquet footer; the MP4 index (moov box).
+           Well under 1% of a large file; small files and float data scanned
+           for NaNs (--nan-budget-mb) cost more.
            Data-dependent checks (MAT NaN counts, unindexed MCAPs) are not
            available in this mode unless the file is small enough for
            --full-read-max-mb, in which case it is fetched whole.
@@ -57,6 +58,7 @@ from phys_ai_dataprofiler.remote.range_file import HfRangeFile
 from phys_ai_dataprofiler.remote.inspector import inspect_mcap_remote, inspect_mat_remote, sniff_format
 from phys_ai_dataprofiler.remote.parquet import inspect_parquet
 from phys_ai_dataprofiler.remote.rosbag import inspect_bag1_remote, inspect_bag2_remote
+from phys_ai_dataprofiler.remote.mp4 import declared_videos, inspect_mp4, recording_seconds, video_stream_name
 from phys_ai_dataprofiler.remote.range_file import LocalRangeFile
 
 try:
@@ -73,7 +75,7 @@ except ImportError:  # pragma: no cover - reported at runtime
 
 
 PROJECT_URL = "https://github.com/akrishni/phys-ai-dataprofiler"
-DEFAULT_EXTENSIONS = (".mcap", ".mat", ".parquet", ".bag", ".db3")
+DEFAULT_EXTENSIONS = (".mcap", ".mat", ".parquet", ".bag", ".db3", ".mp4")
 TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 
 
@@ -93,7 +95,7 @@ class FileReport:
     repo_path: str
     local_path: str | None
     size_bytes: int | None
-    detected_format: str | None            # "mcap", "mat", "parquet", "bag1", "bag2", "unknown"
+    detected_format: str | None            # "mcap", "mat", "parquet", "bag1", "bag2", "mp4", "unknown"
     valid: bool
     mode: str = "remote"                   # "remote" or "download"
     bytes_fetched: int | None = None       # bytes actually read from the Hub
@@ -184,6 +186,12 @@ def _pct(part: int | None, whole: int | None) -> str:
     return f"{part / whole * 100:.2f}%"
 
 
+def sniff_ext(path: str) -> str:
+    """Format implied by a file name alone (used before any bytes are read)."""
+    return {".mcap": "mcap", ".mat": "mat", ".parquet": "parquet", ".bag": "bag1", ".db3": "bag2",
+            ".mp4": "mp4", ".m4v": "mp4", ".mov": "mp4"}.get(Path(path).suffix.lower(), "unknown")
+
+
 def _sniff_local_format(path: Path) -> str:
     """Detect the container format from magic bytes, falling back to the extension."""
     try:
@@ -205,6 +213,32 @@ def resolve_token(explicit: str | None) -> str | None:
         if value:
             return value
     return None
+
+
+def _interleave_kinds(files: list[RemoteFile]) -> list[RemoteFile]:
+    """Order files so a --max-files sample takes from every kind of file in the repo.
+
+    A LeRobot repo sorts `data/*.parquet` before `videos/<camera>/*.mp4`, so the first N paths would be
+    tables only and every camera would go unprofiled. Kinds are the top-level folder plus, under
+    `videos/`, the camera; each kind keeps its own path order and kinds take turns.
+    """
+    from phys_ai_dataprofiler.remote.mp4 import video_stream_name
+    kinds: dict[str, list[RemoteFile]] = {}
+    for f in files:
+        top = f.path.split("/", 1)[0] if "/" in f.path else ""
+        kind = top + ("/" + video_stream_name(f.path)[0] if f.path.lower().endswith(".mp4") else "")
+        kinds.setdefault(kind, []).append(f)
+    out: list[RemoteFile] = []
+    queues = list(kinds.values())
+    i = 0
+    while queues:
+        q = queues[i % len(queues)]
+        out.append(q.pop(0))
+        if not q:
+            queues.remove(q)
+        else:
+            i += 1
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -234,6 +268,7 @@ class HuggingFaceConnector:
         self.log = log or (lambda msg: print(msg, file=sys.stderr))
         self.whoami: dict | None = None
         self.resolved_sha: str | None = None
+        self.video_info: dict[str, dict] = {}    # per-camera fps/size/codec from LeRobot meta/info.json
 
     # -- connection ---------------------------------------------------------
 
@@ -324,7 +359,10 @@ class HuggingFaceConnector:
         skipped: list[dict] = []
         total = 0
 
-        for f in sorted(files, key=lambda x: x.path):
+        ordered = sorted(files, key=lambda x: x.path)
+        if max_files is not None and not explicit_set:
+            ordered = _interleave_kinds(ordered)
+        for f in ordered:
             if explicit_set:
                 if f.path not in explicit_set:
                     continue
@@ -355,6 +393,7 @@ class HuggingFaceConnector:
         for path in sorted(missing):
             skipped.append({"path": path, "size": None, "reason": "not found in repo"})
 
+        selected.sort(key=lambda x: x.path)
         return selected, skipped
 
     # -- access -------------------------------------------------------------
@@ -376,6 +415,16 @@ class HuggingFaceConnector:
             return rf.read_range(0, rf.size).decode("utf-8", "replace")
         finally:
             rf.close()
+
+    def load_video_info(self, files: Iterable[RemoteFile]) -> dict[str, dict]:
+        """Read LeRobot's meta/info.json, if the repo has one, for what each camera should look like."""
+        if not any(f.path == "meta/info.json" for f in files):
+            return {}
+        try:
+            self.video_info = declared_videos(json.loads(self.read_text("meta/info.json")))
+        except Exception as exc:
+            self.log(f"Could not read meta/info.json: {exc}")
+        return self.video_info
 
     def download(self, remote: RemoteFile, local_dir: Path, force: bool = False) -> Path:
         """Download one file into local_dir, preserving its repo path."""
@@ -421,6 +470,18 @@ def _fill_from_results(report: FileReport, fmt: str, res, prof) -> None:
             "frame_rate_hz": res.frame_rate_hz,
             "episodes": (res.episodes or {}).get("count"),
         }
+    elif fmt == "mp4":
+        report.valid = bool(res.is_mp4 and not res.error)
+        report.error = res.error
+        vt = next((t for t in res.tracks if t.handler == "vide"), None)
+        report.summary = {
+            "camera": res.stream_name,
+            "channels": sum(1 for t in res.tracks if t.handler == "vide"),
+            "codec": vt.codec if vt else None,
+            "resolution": f"{vt.width}x{vt.height}" if vt and vt.width else None,
+            "frame_rate_hz": vt.rate_hz if vt else None,
+            "fragmented": res.fragmented,
+        }
     elif fmt in ("bag1", "bag2"):
         report.valid = bool(res.is_bag and not res.error)
         report.error = res.error
@@ -452,9 +513,11 @@ def _fill_from_results(report: FileReport, fmt: str, res, prof) -> None:
         })
 
 
-def inspect_local_file(repo_path: str, local_path: Path, size_hint: int | None, deep: bool = True) -> FileReport:
+def inspect_local_file(repo_path: str, local_path: Path, size_hint: int | None, deep: bool = True,
+                       video_info: dict | None = None) -> FileReport:
     """Full-read inspection of a file on disk (download mode)."""
     t0 = time.time()
+    video_info = video_info or {}
     fmt = _sniff_local_format(local_path)
     size = local_path.stat().st_size if local_path.exists() else size_hint
     report = FileReport(repo_path=repo_path, local_path=str(local_path), size_bytes=size,
@@ -465,10 +528,13 @@ def inspect_local_file(repo_path: str, local_path: Path, size_hint: int | None, 
             res = McapFileInspector(str(local_path)).inspect()
         elif fmt == "mat":
             res = MatFileInspector(str(local_path)).inspect()
-        elif fmt in ("parquet", "bag1", "bag2"):
+        elif fmt in ("parquet", "bag1", "bag2", "mp4"):
             rf = LocalRangeFile(local_path, block_size=1024 * 1024)
             try:
-                if fmt == "parquet":
+                if fmt == "mp4":
+                    cam = video_stream_name(repo_path)[0]
+                    res, prof = inspect_mp4(rf, cam, budget_bytes=1 << 62, declared=video_info.get(cam))
+                elif fmt == "parquet":
                     res, prof = inspect_parquet(rf, column_budget_bytes=1 << 62, nan_check=True)
                 elif fmt == "bag1":
                     res, prof = inspect_bag1_remote(rf, msgidx_budget_bytes=1 << 62)
@@ -483,7 +549,7 @@ def inspect_local_file(repo_path: str, local_path: Path, size_hint: int | None, 
             report.inspect_s = round(time.time() - t0, 3)
             return report
         else:
-            report.error = "Not recognised as MCAP, MAT, Parquet or ROS bag (magic bytes and extension both unknown)"
+            report.error = "Not recognised as MCAP, MAT, Parquet, ROS bag or MP4 (magic bytes and extension both unknown)"
             report.inspect_s = round(time.time() - t0, 3)
             return report
         prof = None
@@ -538,6 +604,11 @@ def inspect_remote_file(connector: HuggingFaceConnector, remote: RemoteFile, arg
             res, prof = inspect_bag1_remote(
                 rf, msgidx_budget_bytes=int(args.msgidx_budget_mb * 1024 * 1024), workers=args.workers, log=log)
             _fill_from_results(report, fmt, res, prof)
+        elif fmt == "mp4":
+            cam = video_stream_name(remote.path)[0]
+            res, prof = inspect_mp4(rf, cam, budget_bytes=int(args.msgidx_budget_mb * 1024 * 1024),
+                                    declared=connector.video_info.get(cam), log=log)
+            _fill_from_results(report, fmt, res, prof)
         elif fmt == "bag2":
             res, prof = inspect_bag2_remote(
                 rf, msgidx_budget_bytes=int(args.msgidx_budget_mb * 1024 * 1024), workers=args.workers, log=log,
@@ -545,7 +616,7 @@ def inspect_remote_file(connector: HuggingFaceConnector, remote: RemoteFile, arg
                 file_name=remote.path.rsplit("/", 1)[-1])
             _fill_from_results(report, fmt, res, prof)
         else:
-            report.error = "Not recognised as MCAP, MAT, Parquet or ROS bag (magic bytes and extension both unknown)"
+            report.error = "Not recognised as MCAP, MAT, Parquet, ROS bag or MP4 (magic bytes and extension both unknown)"
     except Exception as exc:
         report.error = f"Remote inspection failed: {exc}"
     finally:
@@ -579,7 +650,9 @@ def build_totals(files: list[FileReport]) -> dict:
         "by_format": by_format,
         "by_mode": {m: sum(1 for f in files if f.mode == m) for m in ("remote", "download") if any(f.mode == m for f in files)},
         "messages": sum(f.summary.get("messages", 0) or 0 for f in files),
-        "duration_s": round(sum(f.summary.get("duration_s", 0) or 0 for f in files), 3),
+        # Cameras of one recording, and a LeRobot table and its videos, cover the same time: counted once.
+        "duration_s": round(recording_seconds(
+            [(f.repo_path, f.detected_format, f.summary.get("duration_s")) for f in files if f.valid]), 3),
         "findings": sum(f.summary.get("findings", 0) or 0 for f in files),
         "warnings": sum(f.summary.get("warnings", 0) or 0 for f in files),
         "errors": sum(f.summary.get("errors", 0) or 0 for f in files)
@@ -618,7 +691,7 @@ def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
     L.append(f"| By mode | {', '.join(f'{k}: {v}' for k, v in t['by_mode'].items()) or '-'} |")
     L.append(f"| Total size | {_human_size(t['bytes'])} |")
     L.append(f"| Bytes read from Hub | {_human_size(t['bytes_fetched'])} ({_pct(t['bytes_fetched'], t['bytes'])}) in {t['requests']} requests |")
-    L.append(f"| Messages (MCAP, bags) / rows (MAT, Parquet) | {t['messages']:,} |")
+    L.append(f"| Messages (MCAP, bags) / rows (MAT, Parquet) / frames (MP4) | {t['messages']:,} |")
     L.append(f"| Total duration | {t['duration_s']} s |")
     L.append(f"| Findings | {t['findings']} (warn {t['warnings']}, error {t['errors']}) |")
     L.append("")
@@ -696,6 +769,30 @@ def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
                 L.append(f"- Messages: {b['message_count']:,}"
                          + (f" over {b['duration_s']:.1f} s" if b.get("duration_s") else ""))
 
+        if f.detected_format == "mp4" and f.basic:
+            b = f.basic
+            L.append(f"- MP4, brand `{b.get('brand') or '-'}`; boxes {' '.join(b.get('top_level') or [])}; "
+                     f"index {'at the start' if b.get('moov_at_start') else 'at the end'}"
+                     + (f", fragmented ({b.get('fragments_read')} fragment(s) read)" if b.get('fragmented') else "")
+                     + (f"; {b['bitrate_kbps']:,.0f} kbit/s" if b.get('bitrate_kbps') else ""))
+            tracks = b.get("tracks") or []
+            if tracks:
+                L.append("")
+                L.append("| Track | Kind | Codec | Size | Frames | Rate (Hz) | Duration | Keyframes | Max keyframe interval |")
+                L.append("|---|---|---|---|---|---|---|---|---|")
+                for t in tracks:
+                    size = f"{t['width']}x{t['height']}" if t.get("width") else "-"
+                    rate = f"{t['rate_hz']:.2f}" if t.get("rate_hz") else "-"
+                    dur = f"{t['duration_s']:.1f} s" if t.get("duration_s") is not None else "-"
+                    kf = "all" if t.get("keyframes") is None and t.get("handler") == "vide" else (t.get("keyframes") if t.get("keyframes") is not None else "-")
+                    L.append(f"| {t.get('track_id')} | {t.get('handler') or '-'} | {t.get('codec') or t.get('fourcc') or '-'} | "
+                             f"{size} | {t['frame_count'] if t.get('frame_count') is not None else '-'} | {rate} | {dur} | {kf} | "
+                             f"{t['max_keyframe_interval'] if t.get('max_keyframe_interval') is not None else '-'} |")
+            dec = b.get("declared")
+            if dec:
+                L.append(f"- Dataset metadata says: {dec.get('fps')} fps, {dec.get('width')}x{dec.get('height')}, "
+                         f"codec {dec.get('codec') or '-'}")
+
         if f.detected_format == "parquet" and f.basic:
             b = f.basic
             L.append(f"- Rows: {b.get('num_rows') or 0:,} in {b.get('num_row_groups')} row group(s); "
@@ -728,7 +825,7 @@ def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
 
         rich = f.rich or {}
         channels = rich.get("channels") or []
-        if channels and f.detected_format in ("mcap", "bag1", "bag2"):
+        if channels and f.detected_format in ("mcap", "bag1", "bag2", "mp4"):
             L.append("")
             L.append("| Topic | Schema | Modality | Count | Rate (Hz) | Jitter (ms) | Gaps>3x | Max gap (ms) |")
             L.append("|---|---|---|---|---|---|---|---|")
@@ -873,6 +970,9 @@ def run(args: argparse.Namespace) -> RunReport:
                     f"Use --ext to choose other extensions, or --file for a specific path.")
         for f in selected:
             log(f"  + {f.path}  ({_human_size(f.size)})")
+        if any(sniff_ext(f.path) == "mp4" for f in selected) and not args.dry_run:
+            if connector.load_video_info(remote_files):
+                log(f"meta/info.json describes {len(connector.video_info)} camera(s); videos are checked against it")
 
         if args.dry_run:
             log("Dry run: not inspecting.")
@@ -929,7 +1029,8 @@ def run(args: argparse.Namespace) -> RunReport:
                 continue
 
         log(f"{prefix} inspecting {remote.path}")
-        rep = inspect_local_file(remote.path, Path(local_path), remote.size, deep=not args.no_rich)
+        rep = inspect_local_file(remote.path, Path(local_path), remote.size, deep=not args.no_rich,
+                                 video_info=connector.video_info if connector is not None else None)
         rep.download_s = dl_s
         reports.append(rep)
         status = "ok" if rep.valid else f"PROBLEM: {rep.error}"
@@ -1012,7 +1113,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
     sel = p.add_argument_group("file selection")
     sel.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS),
-                     help="Extensions to consider (default: .mcap .mat .parquet .bag .db3)")
+                     help="Extensions to consider (default: .mcap .mat .parquet .bag .db3 .mp4)")
     sel.add_argument("--include", action="append", help="Glob on repo path; repeatable")
     sel.add_argument("--exclude", action="append", help="Glob on repo path to skip; repeatable")
     sel.add_argument("--file", action="append", help="Exact repo path to fetch; repeatable (bypasses --ext)")

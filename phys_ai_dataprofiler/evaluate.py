@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from phys_ai_dataprofiler.remote.mp4 import recording_seconds, video_stream_name
 from phys_ai_dataprofiler.requirements import Requirements, StreamRequirement
 
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
@@ -40,7 +41,7 @@ ESTIMATED_COUNTS = {"estimated_counts", "partial_scan"}
 # Findings that mean the NaN scan did not cover all float data.
 NAN_INCOMPLETE = {"nan_check_partial", "nan_check_sampled", "nan_check_failed"}
 NAN_SKIPPED = {"nan_check_skipped"}
-UNINDEXED = {"unindexed_mcap", "unindexed_bag", "truncated"}
+UNINDEXED = {"unindexed_mcap", "unindexed_bag", "truncated", "no_moov"}
 # Findings that mean some streams may exist without having been seen or named.
 INCOMPLETE_STREAM_LIST = {"unknown_channels", "chunks_not_decoded", "partial_scan", "walk_stopped"}
 # Formats whose NaN count is a real measurement (MCAP and bag payloads are never decoded).
@@ -94,6 +95,12 @@ class _FileView:
     duration_s: float | None
     indexed: bool
     basic: dict
+    files: list[str] = field(default_factory=list)   # for a merged video recording: its camera files
+    bad_files: int = 0                                # of those, how many could not be profiled
+
+    @property
+    def n_files(self) -> int:
+        return len(self.files) or 1
 
     @property
     def timing_sampled(self) -> bool:
@@ -119,7 +126,46 @@ def _views(report: dict, req: Requirements) -> tuple[list[_FileView], list[str]]
             duration_s=(f.get("summary") or {}).get("duration_s"),
             indexed=bool(rich.get("indexed")), basic=f.get("basic") or {},
         ))
-    return views, out_of_scope
+    return _merge_videos(views), out_of_scope
+
+
+def _merge_videos(views: list[_FileView]) -> list[_FileView]:
+    """One view per video group (see `video_stream_name`): the MP4s of every camera that cover the same
+    time, together. Two cameras in two files then meet `min_count: 2`, and coverage counts recordings
+    (LeRobot v2 episodes; the whole video set for v3), not camera files.
+    """
+    groups: dict[str, list[_FileView]] = {}
+    for fv in views:
+        if fv.format == "mp4":
+            groups.setdefault(video_stream_name(fv.path)[1], []).append(fv)
+    merged, seen = [], set()
+    for fv in views:
+        if fv.format != "mp4":
+            merged.append(fv)
+            continue
+        key = video_stream_name(fv.path)[1]
+        if key in seen:
+            continue
+        seen.add(key)
+        members = groups[key]
+        if len(members) == 1:
+            fv.files = [fv.path]
+            merged.append(fv)
+            continue
+        bad = [m for m in members if not m.valid]
+        per_cam: dict[str, float] = {}
+        for m in members:
+            if m.valid and m.duration_s:
+                cam = video_stream_name(m.path)[0]
+                per_cam[cam] = per_cam.get(cam, 0.0) + float(m.duration_s)
+        merged.append(_FileView(
+            path=key, format="mp4", valid=not bad,
+            error="; ".join(f"{m.path}: {m.error or 'invalid'}" for m in bad[:3]) or None,
+            channels=[c for m in members for c in m.channels],
+            finding_types=set().union(*(m.finding_types for m in members)),
+            duration_s=max(per_cam.values()) if per_cam else None, indexed=all(m.indexed for m in members),
+            basic={}, files=[m.path for m in members], bad_files=len(bad)))
+    return merged
 
 
 # --------------------------------------------------------------------------- #
@@ -217,7 +263,9 @@ def _channel_status(sr: StreamRequirement, fv: _FileView, ch: dict) -> tuple[str
 # --------------------------------------------------------------------------- #
 
 def _stream_file_status(sr: StreamRequirement, fv: _FileView) -> dict:
-    if not fv.valid:
+    if not fv.valid and fv.channels and fv.format == "mp4":
+        pass   # a recording with one broken camera still has the others; the broken one is noted below
+    elif not fv.valid:
         return {"file": fv.path, "status": UNKNOWN, "matched": [], "detail": f"file not profiled: {fv.error or 'invalid'}"}
     matched = [c for c in fv.channels if sr.match.matches(c)]
     if not matched:
@@ -228,22 +276,24 @@ def _stream_file_status(sr: StreamRequirement, fv: _FileView) -> dict:
                     "detail": "no matching stream among those read, but the stream list is incomplete "
                               "(unnamed channels or undecoded chunks)"}
         if fv.format == "parquet" and sr.match.wants_video():
-            return {"file": fv.path, "status": UNKNOWN, "matched": [],
-                    "detail": "no image column; LeRobot-style datasets keep cameras in separate video files, "
-                              "which are not profiled"}
+            return {"file": fv.path, "status": UNKNOWN, "matched": [], "camera_elsewhere": True,
+                    "detail": "no image column; LeRobot-style datasets keep cameras in separate MP4 files, "
+                              "and none were profiled"}
         return {"file": fv.path, "status": FAIL, "matched": [], "detail": "no matching stream"}
     per = []
     for ch in matched:
         st, notes, measured = _channel_status(sr, fv, ch)
         per.append({"topic": ch.get("topic"), "status": st, "notes": notes, "measured": measured,
                     "count": ch.get("msg_count"), "rate_hz": ch.get("rate_hz"), "max_gap_ms": ch.get("max_gap_ms")})
+    if len({p["topic"] for p in per}) < len(per):
+        per = _per_stream(per, sr.coverage)
     need = len(per) if sr.min_count == "all" else sr.min_count
     n_pass = sum(1 for p in per if p["status"] == PASS)
     n_maybe = sum(1 for p in per if p["status"] == UNKNOWN)
     if n_pass >= need:
         st = PASS
-    elif n_pass + n_maybe >= need:
-        st = UNKNOWN
+    elif n_pass + n_maybe >= need or (not fv.valid and fv.format == "mp4"):
+        st = UNKNOWN      # an unreadable camera file in the recording could hold the missing stream
     else:
         st = FAIL
     if st == PASS:
@@ -257,6 +307,33 @@ def _stream_file_status(sr: StreamRequirement, fv: _FileView) -> dict:
     return {"file": fv.path, "status": st, "matched": [p["topic"] for p in per], "detail": detail,
             "rates_hz": [p["rate_hz"] for p in per if p["rate_hz"] is not None],
             "max_gaps_ms": [p["max_gap_ms"] for p in per if p["max_gap_ms"] is not None]}
+
+
+def _per_stream(per: list[dict], coverage: float) -> list[dict]:
+    """Fold the files of one stream into one entry (a LeRobot v3 camera spread over several MP4s).
+
+    The stream passes when `coverage` of its files pass, like coverage across recordings elsewhere.
+    """
+    by: dict[str, list[dict]] = {}
+    for p in per:
+        by.setdefault(p["topic"], []).append(p)
+    out = []
+    for topic, ps in by.items():
+        if len(ps) == 1:
+            out.append(ps[0])
+            continue
+        n, n_pass = len(ps), sum(p["status"] == PASS for p in ps)
+        n_fail = sum(p["status"] == FAIL for p in ps)
+        st = PASS if n_pass >= coverage * n - 1e-9 else UNKNOWN if n - n_fail >= coverage * n - 1e-9 else FAIL
+        bad = [p for p in ps if p["status"] != PASS]
+        notes = [f"{len(bad)} of {n} files: " + "; ".join(bad[0]["notes"])] if bad else []
+        rates = [p["rate_hz"] for p in ps if p["rate_hz"] is not None]
+        gaps = [p["max_gap_ms"] for p in ps if p["max_gap_ms"] is not None]
+        out.append({"topic": topic, "status": st, "notes": notes,
+                    "measured": [f"{n} files"] + ([f"rate {_range(rates, ' Hz')}"] if rates else []),
+                    "count": sum(p["count"] or 0 for p in ps), "rate_hz": min(rates) if rates else None,
+                    "max_gap_ms": max(gaps) if gaps else None})
+    return out
 
 
 def _range(vals: list[float], unit: str) -> str:
@@ -294,14 +371,35 @@ def _resolve_hint(details: list[dict]) -> str | None:
         hints.append("fix or exclude the files that failed to profile (files.exclude)")
     if "stream list is incomplete" in text:
         hints.append("raise --msgidx-budget-mb so the record walk names every channel")
-    if "separate video files" in text:
-        hints.append("cameras in video files are not profiled yet; mark this stream required: false, "
-                     "or match on the dataset's own camera columns")
+    if "separate MP4 files" in text:
+        hints.append("profile the videos too: keep .mp4 in --ext and do not exclude videos/ "
+                     "(--max-files may also have left them out)")
     return "; ".join(dict.fromkeys(hints)) or None
 
 
+def _applicable(sr: StreamRequirement, views: list[_FileView], details: list[dict]) -> list[dict]:
+    """Drop files that cannot hold this stream because the dataset keeps it in other files.
+
+    LeRobot keeps state and actions in Parquet and each camera in its own MP4. When both kinds are in
+    scope, a camera requirement is judged on the videos (and any other file that has a camera), and any
+    other requirement on the files that are not videos.
+    """
+    if {fv.format == "mp4" for fv in views} != {True, False}:
+        return details
+    is_camera = sr.match.wants_video() or any(d["matched"] for fv, d in zip(views, details) if fv.format == "mp4")
+    keep = []
+    for fv, d in zip(views, details):
+        if not d["matched"] and fv.valid:
+            if fv.format == "mp4" and not is_camera:
+                continue        # e.g. robot state: never in a video file
+            if d.get("camera_elsewhere") and is_camera:
+                continue        # the cameras are in the MP4s, judged there
+        keep.append(d)
+    return keep or details
+
+
 def _check_stream(sr: StreamRequirement, views: list[_FileView]) -> Check:
-    details = [_stream_file_status(sr, fv) for fv in views]
+    details = _applicable(sr, views, [_stream_file_status(sr, fv) for fv in views])
     n = len(details)
     n_pass = sum(1 for d in details if d["status"] == PASS)
     n_fail = sum(1 for d in details if d["status"] == FAIL)
@@ -319,7 +417,12 @@ def _check_stream(sr: StreamRequirement, views: list[_FileView]) -> Check:
     expected = (f"{'every' if sr.min_count == 'all' else (str(sr.min_count) + ' or more')} stream(s) matching "
                 f"[{sr.match.describe()}]" + (f" with {thresholds}" if thresholds else "")
                 + (f", in {sr.coverage:.0%} of files" if sr.coverage < 1 else " in every file"))
-    observed = f"satisfied in {n_pass} of {n} file(s)" + (f", failed in {n_fail}" if n_fail else "")
+    unit = "file(s)"
+    if details and all(d["file"].endswith("videos/*") for d in details):
+        unit = "video set(s)"          # LeRobot v3: all videos judged together
+    elif details and all("videos/" in d["file"] and "/*/" in d["file"] for d in details):
+        unit = "recording(s)"          # LeRobot v2: one group of camera files per episode
+    observed = f"satisfied in {n_pass} of {n} {unit}" + (f", failed in {n_fail}" if n_fail else "")
     evidence = []
     shown = [d for d in details if d["status"] != PASS][:5] or details[:3]
     for d in shown:
@@ -328,7 +431,7 @@ def _check_stream(sr: StreamRequirement, views: list[_FileView]) -> Check:
     if hidden > 0:
         evidence.append(f"... {hidden} more file(s) not passing")
     if sr.match.wants_video():
-        evidence.append("note: image resolution and codec are not checked (payloads are not decoded)")
+        evidence.append("note: requirements do not check resolution or codec; MP4 files report both in the profile")
     return Check(id=f"stream:{sr.name}", label=sr.name, status=status, required=sr.required,
                  expected=expected, observed=observed, evidence=evidence,
                  resolve=_resolve_hint(details) if status == UNKNOWN else None, files=details,
@@ -351,6 +454,10 @@ def _episodes(views: list[_FileView]) -> tuple[list[float] | None, int | None, b
         count = sum(int(fv.basic["episodes"]["count"]) for fv in lerobot)
         complete = all(fv.basic["episodes"].get("complete", False) for fv in lerobot)
         return None, count, complete, f"Parquet episode column ({len(lerobot)} file(s))"
+    if any(fv.format == "mp4" and not all(p.rsplit("/", 1)[-1].startswith("episode_") for p in fv.files)
+           for fv in views):
+        # LeRobot v3 packs many episodes into each video; only the Parquet table knows where they split.
+        return None, None, False, "videos hold several episodes each; episodes come from the Parquet episode column"
     timed = [fv for fv in views if fv.valid and fv.duration_s]
     if not timed:
         return None, None, False, "no file with a time range"
@@ -361,11 +468,12 @@ def _episodes(views: list[_FileView]) -> tuple[list[float] | None, int | None, b
 def _check_dataset(req: Requirements, views: list[_FileView], report: dict) -> list[Check]:
     d = req.dataset
     checks: list[Check] = []
-    n = len(views)
+    n = sum(fv.n_files for fv in views)          # files, counting each camera of a recording
     invalid = [fv for fv in views if not fv.valid]
-    durations = [fv.duration_s for fv in views if fv.valid and fv.duration_s]
+    n_invalid = sum(fv.bad_files or 1 for fv in invalid)
     missing_time = [fv.path for fv in views if fv.valid and not fv.duration_s]
-    total_h = sum(durations) / 3600 if durations else 0.0
+    # Cameras of a recording, and a LeRobot table and its videos, cover the same time: counted once.
+    total_h = recording_seconds([(fv.path, fv.format, fv.duration_s) for fv in views if fv.valid]) / 3600
     selection_partial = bool(report.get("files_skipped")) and any(
         s.get("reason", "").startswith(("exceeds --max", "would exceed")) for s in report.get("files_skipped") or [])
 
@@ -374,13 +482,13 @@ def _check_dataset(req: Requirements, views: list[_FileView], report: dict) -> l
                             observed=observed, evidence=evidence or [], resolve=resolve, headline=observed))
 
     if d.min_total_hours is not None:
-        observed = f"{total_h:.2f} h over {len(durations)} file(s)"
+        observed = f"{total_h:.2f} h over {sum(fv.n_files for fv in views if fv.valid and fv.duration_s)} file(s)"
         if total_h >= d.min_total_hours:
             add("min_total_hours", PASS, f">= {_fmt(d.min_total_hours)} h", observed)
         elif invalid or missing_time or selection_partial:
             why = []
             if invalid:
-                why.append(f"{len(invalid)} file(s) not profiled")
+                why.append(f"{n_invalid} file(s) not profiled")
             if missing_time:
                 why.append(f"{len(missing_time)} file(s) without a time range")
             if selection_partial:
@@ -449,7 +557,8 @@ def _check_dataset(req: Requirements, views: list[_FileView], report: dict) -> l
             for c in fv.channels:
                 by_topic.setdefault(str(c.get("topic")), set()).add(str(c.get("schema")))
         clash = {t: s for t, s in by_topic.items() if len(s) > 1}
-        topic_sets = {frozenset(str(c.get("topic")) for c in fv.channels) for fv in views if fv.valid and fv.channels}
+        topic_sets = {frozenset(str(c.get("topic")) for c in fv.channels) for fv in views
+                      if fv.valid and fv.channels and fv.format != "mp4"}
         exp = "each stream has one type in every file"
         if not by_topic:
             add("same_schema_across_files", UNKNOWN, exp, "no streams read")
@@ -463,17 +572,17 @@ def _check_dataset(req: Requirements, views: list[_FileView], report: dict) -> l
                     [f"{len(invalid)} file(s) not profiled"] if invalid else []))
 
     if d.max_invalid_files_pct is not None:
-        pct = 100 * len(invalid) / n if n else 0.0
+        pct = 100 * n_invalid / n if n else 0.0
         st = PASS if pct <= d.max_invalid_files_pct else FAIL
         add("max_invalid_files_pct", st, f"<= {_fmt(d.max_invalid_files_pct)}% of files unreadable",
-            f"{len(invalid)} of {n} ({pct:.1f}%)", [f"{fv.path}: {fv.error}" for fv in invalid[:5]])
+            f"{n_invalid} of {n} ({pct:.1f}%)", [f"{fv.path}: {fv.error}" for fv in invalid[:5]])
 
     if d.max_unindexed_files_pct is not None:
         unidx = [fv for fv in views if fv.finding_types & UNINDEXED]
-        pct = 100 * len(unidx) / n if n else 0.0
+        pct = 100 * sum(fv.n_files for fv in unidx) / n if n else 0.0
         st = PASS if pct <= d.max_unindexed_files_pct else FAIL
         add("max_unindexed_files_pct", st, f"<= {_fmt(d.max_unindexed_files_pct)}% unindexed or truncated",
-            f"{len(unidx)} of {n} ({pct:.1f}%)", [fv.path for fv in unidx[:5]])
+            f"{sum(fv.n_files for fv in unidx)} of {n} ({pct:.1f}%)", [fv.path for fv in unidx[:5]])
     return checks
 
 

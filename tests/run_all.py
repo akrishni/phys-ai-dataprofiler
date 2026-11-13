@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-HUB_CAPABLE = {"test_parquet_inspector.py", "test_rosbag_inspector.py"}
+HUB_CAPABLE = {"test_parquet_inspector.py", "test_rosbag_inspector.py", "test_mp4_inspector.py"}
 
 
 def main() -> int:

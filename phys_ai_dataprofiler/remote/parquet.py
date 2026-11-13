@@ -135,10 +135,22 @@ def _type_str(t) -> str:
     return s if len(s) <= _DISPLAY_MAX else s[: _DISPLAY_MAX - 3] + "..."
 
 
+def _is_numeric(t) -> bool:
+    while _is_list(t):
+        t = t.value_type
+    return pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_boolean(t)
+
+
 def _modality(name: str, t) -> str:
     n = name.lower()
-    if any(k in n for k in ("image", "img", "rgb", "depth", "camera", "video")):
-        return "image"
+    calib = any(k in n for k in ("extrinsic", "intrinsic", "calib", "_info", "distortion"))
+    # Image columns hold encoded frames (binary, or LeRobot's struct<bytes, path>) or raw pixel arrays.
+    # A numeric column named after a camera (camera_extrinsics, camera_pose) is calibration, not frames.
+    if not calib and any(k in n for k in ("image", "img", "rgb", "depth", "camera", "video")):
+        if not _is_numeric(t) or any(k in n for k in ("image", "img", "rgb", "depth")):
+            return "image"
+    if calib:
+        return "data"
     if n in TIMESTAMP_CANDIDATES or "timestamp" in n:
         return "timestamps"
     if n.endswith("index") or n.endswith("_id") or n == "id":
@@ -280,6 +292,19 @@ def _chunk_range(c) -> tuple[int, int]:
     if c.has_dictionary_page and c.dictionary_page_offset:
         start = min(start, c.dictionary_page_offset)
     return start, start + (c.total_compressed_size or 0)
+
+
+def _plan_columns(md, leaves: list[int], budget: int) -> tuple[list[int], int]:
+    """Leaves to scan when even one row group of them is over budget: smallest first, until it is spent."""
+    size = {li: sum(md.row_group(r).column(li).total_compressed_size or 0 for r in range(md.num_row_groups))
+            for li in leaves}
+    keep, used = [], 0
+    for li in sorted(leaves, key=lambda x: size[x]):
+        if used + size[li] > budget:
+            break
+        keep.append(li)
+        used += size[li]
+    return sorted(keep), used
 
 
 def _plan_row_groups(md, leaves: list[int], budget: int) -> tuple[list[int], int, bool]:
@@ -470,6 +495,16 @@ def inspect_parquet(
     nan_leaves = [li for c in float_cols for li in by_name[c.name][1]] if nan_check else []
     ts_plan = _plan_row_groups(md, ts_leaves, column_budget_bytes) if ts_leaves else None
     nan_plan = _plan_row_groups(md, nan_leaves, nan_budget_bytes) if nan_leaves else None
+    nan_cols_skipped = 0
+    if nan_plan and nan_plan[1] > nan_budget_bytes:
+        # One row group holds more float data than the budget, so row groups cannot be sampled:
+        # scan whole columns, smallest first, and leave the rest unscanned.
+        keep, used = _plan_columns(md, nan_leaves, nan_budget_bytes)
+        kept = [c for c in float_cols if set(by_name[c.name][1]) <= set(keep)]
+        nan_cols_skipped = len(float_cols) - len(kept)
+        float_cols = kept
+        nan_leaves = [li for c in kept for li in by_name[c.name][1]]
+        nan_plan = (list(range(md.num_row_groups)), used, False) if nan_leaves else None
 
     # Timing and NaN reads overlap (a float timestamp is both). When together they cover most of a
     # small file, one request for the whole file is cheaper than fetching the same columns twice.
@@ -552,7 +587,12 @@ def inspect_parquet(
                                         f"NaN scan covered {len(rgs)}/{md.num_row_groups} row groups"))
         except Exception as exc:
             findings.append(Finding("warn", "nan_check_failed", None, str(exc)))
-    elif float_cols:
+    if nan_cols_skipped:
+        findings.append(Finding("info", "nan_check_partial", None,
+                                f"NaN scan covered {len(float_cols)} of {len(float_cols) + nan_cols_skipped} float "
+                                f"columns: the file is one row group with more float data than "
+                                f"--nan-budget-mb {nan_budget_bytes / (1 << 20):g}"))
+    elif not nan_check and float_cols:
         findings.append(Finding("info", "nan_check_skipped", None,
                                 "Parquet statistics do not count NaN; NaN scan disabled (--nan-budget-mb 0)"))
 

@@ -65,9 +65,18 @@ for typos (`min_rate` → `min_rate_hz`) and a pointer when a field is in the wr
 `reward`, `flag`, `timestamps`, `index`, `text`, `binary`, `timeseries`, `data`, `other`. They come from
 topic, column and type names, so a `topic` glob is often the more reliable match on unfamiliar data.
 
-**Not accepted, on purpose:** `min_resolution`, `codec`, `min_dims`. The profiler reads indexes and
-metadata and never decodes image or message payloads, so it cannot measure these. They are rejected
-with that reason rather than accepted and left unknown forever.
+**Not accepted, on purpose:** `min_resolution`, `codec`, `min_dims`. MP4 profiles report resolution and
+codec from the file's index, but MCAP and bag image messages are never decoded, so these could not be
+checked on most formats. They are rejected with that reason rather than accepted and left unknown.
+
+**LeRobot videos.** LeRobot keeps state and actions in Parquet tables and each camera in its own MP4s.
+With both in scope, a camera requirement is judged on the videos and every other requirement on the
+tables. Cameras are matched by name (`observation.images.wrist` for `topic: "*wrist*"`), and several
+cameras in separate files together meet `min_count: 2`. In LeRobot v3 every camera file packs many
+episodes and cameras split files at different points, so all videos are judged as one set and each
+camera passes when `coverage` of its files do; in v2 (one file per camera per episode) each episode is a
+recording. Hours come from the table when it is profiled, otherwise one camera per recording, never the
+sum of every camera file.
 
 ## How pass, fail and unknown are decided
 
@@ -84,8 +93,8 @@ A requirement is unknown, never a guessed pass or fail, when:
   sampled to stay within budget, an estimate decides pass or fail only if it clears the threshold by 10%.
   Measured numbers get a 0.1% allowance for float rounding, so 9.9999 Hz meets `min_rate_hz: 10`.
 - **The data might be there but was not seen.** A required stream is missing from a file whose stream
-  list is incomplete (unnamed channels, undecoded chunks). Or a camera is missing from a Parquet file;
-  LeRobot keeps cameras in separate video files, which are not profiled yet.
+  list is incomplete (unnamed channels, undecoded chunks). Or a camera is missing from a Parquet table and
+  none of the dataset's MP4s were profiled (`--ext` without `.mp4`, or `files.exclude` on `videos/`).
 - **Not every file was looked at.** A file failed to profile, or `--max-files`/`--max-total-mb` left files
   out and the total so far is below the threshold. Once the profiled files already clear it, such as
   20 hours already counted, it is a pass.

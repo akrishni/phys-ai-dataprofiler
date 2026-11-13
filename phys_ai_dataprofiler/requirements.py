@@ -49,11 +49,11 @@ MODALITY_ALIASES = {"image": "video"}
 # Fields people will reach for that the profiler cannot measure yet. Rejected with a reason rather than
 # accepted and silently left unknown forever.
 NOT_MEASURABLE = {
-    "min_resolution": "image resolution is not measured: the profiler reads indexes and metadata, it does not "
-                      "decode image or video payloads",
-    "max_resolution": "image resolution is not measured (payloads are not decoded)",
-    "resolution": "image resolution is not measured (payloads are not decoded)",
-    "codec": "video codec is not measured (payloads are not decoded)",
+    "min_resolution": "resolution is not a requirement field: MP4 profiles report it, but MCAP and bag image "
+                      "messages are never decoded, so it could not be checked on most formats",
+    "max_resolution": "resolution is not a requirement field (MP4 profiles report it; MCAP/bag payloads are not decoded)",
+    "resolution": "resolution is not a requirement field (MP4 profiles report it; MCAP/bag payloads are not decoded)",
+    "codec": "codec is not a requirement field (MP4 profiles report it; MCAP/bag payloads are not decoded)",
     "min_dims": "array dimensions of MCAP/bag messages are not measured (payloads are not decoded)",
 }
 
