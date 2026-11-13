@@ -43,7 +43,7 @@ that region over HTTP Range requests yields the same answers as a full scan, exc
 | ROS 1 bag v2.0 | Bag header (first 4 KB) holds `index_pos`; Connection and ChunkInfo records sit from `index_pos` to EOF. | IndexData records right after each chunk (12 B per message). Chunk payloads, the only compressed part, are skipped. | 5.8 GB nuScenes bag: 533 KB read (0.009%), 1,586 requests (one per chunk), 48 s. Synthetic bags: stats identical to a `rosbags` full read. |
 | ROS 2 bag | `metadata` table (rosbag2 v9+) or `metadata.yaml` sidecar: per-topic counts, start time, duration, storage id. MCAP storage is the default since Iron and behaves as above. | SQLite storage: topic_id and timestamp lead each `messages` leaf cell, so leaf pages give per-topic timing without payloads or overflow pages; `timestamp_idx` gives the time range when leaves are sampled. | 269.6 MB bag: 872 KB read (0.32%), 189 requests, 7.2 s. 18.6 MB bag: stats identical to a direct SQLite read. |
 | MAT v5/v7 | 128-byte header, then a chain of data elements; each element's tag gives its length so payloads are skipped. Compressed (v7) elements are inflated only until the name is reached. | n/a (no time axis in the container) | Variable list identical to scipy on both sample files; one 64 KB block per few variables. |
-| MAT v7.3 (HDF5) | 128-byte MATLAB header, HDF5 superblock at offset 512, then object headers and B-trees. `h5py` over a block-cached range file lists top-level variables, struct fields and MATLAB classes. | n/a | 2.6 GB Attia 2020 batch file on the Hub: 808 KB read (0.03%), 4 requests, 1.6 s. Requires Python <= 3.13 for an `h5py` wheel today. |
+| MAT v7.3 (HDF5) | 128-byte MATLAB header, HDF5 superblock at offset 512, then object headers and B-trees. `h5py` over a block-cached range file lists top-level variables, struct fields and MATLAB classes. | n/a | 2.4 GB Attia 2020 batch file on the Hub: 232 KB read (0.01%), 4 requests, with the default 64 KB block (re-measured 2026-11-12; an earlier 256 KB-block run read 808 KB). Requires Python <= 3.13 for an `h5py` wheel today. |
 | LeRobot v3 | `meta/info.json`, `meta/stats.json`, `meta/episodes/*.parquet` already hold schema, fps, codec, resolution, episode lengths and per-feature stats. | Parquet `timestamp` column, reachable via the Parquet footer. Videos never opened. | Not needed; the sidecars are the profile. |
 
 The Hub cooperates: resolve URLs redirect to a CDN that answers `206 Partial Content` and the tree API returns
@@ -264,8 +264,8 @@ bandwidth or CPU. Chunk sampling caps per-file requests when files have tens of 
 
 - **Unindexed or truncated files** need a full read. The planner surfaces them, the verdict marks affected
   requirements `unknown`, and the user decides whether to pay for T3 on a size-capped subset.
-- **HDF5 metadata is scattered** in general, but the one real MAT v7.3 file measured so far (2.6 GB, MATLAB
-  struct arrays) needed only 4 block reads with a 256 KB block cache. Re-measure on files with thousands of
+- **HDF5 metadata is scattered** in general, but the one real MAT v7.3 file measured so far (2.4 GB, MATLAB
+  struct arrays) needed only 4 block reads. Re-measure on files with thousands of
   variables before promising numbers.
 - **SQLite bags** give global timing cheaply but per-topic timing only by touching table pages. Rely on
   `metadata.yaml` for counts and treat per-topic jitter as T2.

@@ -5,8 +5,8 @@
 Profile physical-AI and lab datasets on the Hugging Face Hub **without downloading them**, and check
 them against what your model needs.
 
-It reads only the bytes that hold metadata (headers, indexes, footers) through HTTP range requests,
-usually well under 1% of each file, and reports streams, message counts, rates, jitter, gaps, episodes,
+It reads only the bytes that hold metadata (headers, indexes, footers) through HTTP range requests, and
+reports streams, message counts, rates, jitter, gaps, episodes,
 NaN counts and problems such as truncated or unindexed recordings. A requirements file turns that into a
 pass / fail / unknown verdict, and `compare` ranks candidate datasets side by side.
 
@@ -18,7 +18,10 @@ pass / fail / unknown verdict, and `compare` ranks candidate datasets side by si
 | MATLAB `.mat` (v5, v7, v7.3) | header and each variable's header; float data within a NaN budget |
 | Parquet / LeRobot | footer, column statistics, timestamp and episode columns |
 
-Measured on public Hub data: a 5.8 GB ROS 1 bag profiled from 533 KB, a 2.6 GB MAT v7.3 file from 808 KB.
+On large files that is usually well under 1%: a 5.8 GB ROS 1 bag is profiled from 533 KB, a 2.4 GB MAT v7.3
+file from 232 KB. Small files cost proportionally more, because headers and indexes have a minimum size and
+the NaN scan reads float data up to `--nan-budget-mb` (default 32 MB per file): a 659 KB LeRobot file is
+read in full. All figures in this README were measured with default settings.
 
 ## Install
 
@@ -98,9 +101,10 @@ Timing statistics use the same code as MCAP. Tests compare every case against a 
 
 | Dataset | Result | Read |
 |---|---|---|
-| `Adapting/nuscenes-rosbags` `103.bag` (ROS 1) | 14 topics, 1,585 chunks, 19.5 s | 533 KB of 5.8 GB |
-| `dvar1ch/ros2-bag-datasets` (ROS 2 SQLite, 2 files) | `/image` at 30 Hz, metadata v9, jazzy | 1.5 MB of 668 MB |
-| `liuxh010/IndoorLocalization_...` (ROS 1), `UniflexAI/rosbag_lekiwi_exp_result` (ROS 2) | per-topic stats identical to a full read | 146 KB of 891 KB; 2.1 MB of 18.6 MB |
+| `Adapting/nuscenes-rosbags` `103.bag` (ROS 1) | 14 topics, 1,585 chunks, 19.5 s | 533 KB of 5.8 GB (0.01%) |
+| `dvar1ch/ros2-bag-datasets` (ROS 2 SQLite, 2 files) | `/image` at 30 Hz, metadata v9, jazzy | 1.5 MB of 668 MB (0.2%) |
+| `UniflexAI/rosbag_lekiwi_exp_result` (ROS 2) | per-topic stats identical to a full read | 2.0 MB of 17.7 MB (11%) |
+| `liuxh010/IndoorLocalization_...` (ROS 1) | per-topic stats identical to a full read | 142 KB of 870 KB (16%) |
 
 ## Parquet support
 
@@ -120,8 +124,12 @@ NaN/inf counts are not in Parquet statistics, so float columns are read too, cap
 
 | Dataset | Result | Read |
 |---|---|---|
-| `lerobot/pusht` (LeRobot v3) | 206 episodes at 10 Hz, matching `meta/info.json` | 205 KB of 659 KB |
-| `nvidia/Nemotron-Personas-Vietnam` (text) | 90,910 rows, 21 columns per file | 143 KB of 194 MB |
+| `nvidia/Nemotron-Personas-Vietnam` (text, one file) | 90,910 rows, 21 columns | 143 KB of 195 MB (0.07%) |
+| `lerobot/pusht` (LeRobot v3) | 206 episodes at 10 Hz, matching `meta/info.json` | 659 KB of 659 KB (100%) |
+| same, `--nan-budget-mb 0` | same episodes and rate; no NaN counts | 194 KB of 659 KB (29%) |
+
+`pusht` is small and almost all float state and action columns, so the default NaN scan reads all of it.
+On a dataset of that size the full read is cheap; the budget only limits the cost on large files.
 
 ## Usage
 

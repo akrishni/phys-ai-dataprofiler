@@ -11,7 +11,8 @@ Two modes:
   remote   (default) Nothing is downloaded. Files are read through HTTP Range
            requests and only the bytes that hold metadata are fetched: the
            MCAP header, footer, summary and message indexes; the MAT header
-           and per-variable headers. Typically well under 1% of the file.
+           and per-variable headers. Well under 1% of a large file; small files
+           and float data scanned for NaNs (--nan-budget-mb) cost more.
            Data-dependent checks (MAT NaN counts, unindexed MCAPs) are not
            available in this mode unless the file is small enough for
            --full-read-max-mb, in which case it is fetched whole.

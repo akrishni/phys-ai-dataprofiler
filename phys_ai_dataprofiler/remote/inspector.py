@@ -7,7 +7,7 @@ the bytes that hold metadata:
 
 MCAP  header (start), footer + summary section (end) and, for timing stats,
       the MessageIndex records that follow each chunk. Message payloads are
-      never read, so for a typical file this is well under 1% of its size.
+      never read, so for a large file this is well under 1% of its size.
       Files with no summary (truncated recordings, or written without one)
       are walked record by record instead: chunk headers and message indexes
       are read, and a chunk body only when it is the sole source of a
