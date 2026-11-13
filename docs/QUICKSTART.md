@@ -174,7 +174,7 @@ pip install h5py
 
 ## Next Steps
 
-- Read the full [README.md](README.md) for detailed documentation
+- Read the [README](../README.md) for the profiler, and [LOCAL_INSPECTORS.md](LOCAL_INSPECTORS.md) for these inspectors
 - Check [SUMMARY.md](SUMMARY.md) for implementation details
 - Browse the source code in the `phys_ai_dataprofiler/` package
 - Create your own file format inspector using the same pattern!
@@ -189,7 +189,7 @@ pip install h5py
 ## Need Help?
 
 Check these files for more information:
-- `README.md` - Full documentation
+- `LOCAL_INSPECTORS.md` - Full-read inspector reference
 - `SUMMARY.md` - Implementation details
 - `demo.py` - Working examples
 - Source code in `phys_ai_dataprofiler/` - Inline documentation

@@ -29,7 +29,7 @@ Both inspectors follow similar architecture patterns and provide detailed metada
 - `samples/sample_v7.mat` - MAT-File v7 (compressed) with sensor data
 
 ### Documentation
-- `README.md` - Complete documentation for both inspectors
+- `docs/LOCAL_INSPECTORS.md` - Documentation for both inspectors
 - `SUMMARY.md` - This file
 
 ## Architecture
