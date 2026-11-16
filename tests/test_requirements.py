@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from phys_ai_dataprofiler.compare import compare_reports, render_compare_markdown  # noqa: E402
 from phys_ai_dataprofiler.evaluate import (  # noqa: E402
-    FAIL, PASS, UNKNOWN, compare, evaluate, render_verdict_markdown, verdict_to_dict)
+    FAIL, PASS, UNKNOWN, compare, evaluate, overlap_pct, render_verdict_markdown, verdict_to_dict)
 from phys_ai_dataprofiler.requirements import (  # noqa: E402
     RequirementsError, list_presets, load_requirements, parse_requirements)
 
@@ -44,9 +44,14 @@ def errors_of(doc) -> list[str]:
     return []
 
 
-def ch(topic, modality="other", schema="X", rate=None, gap=None, gaps=0, count=100, nan=0, jitter=None):
-    return {"topic": topic, "schema": schema, "modality": modality, "msg_count": count, "rate_hz": rate,
-            "jitter_ms": jitter, "gaps_over_3x": gaps, "max_gap_ms": gap, "nan_count": nan}
+def ch(topic, modality="other", schema="X", rate=None, gap=None, gaps=0, count=100, nan=0, jitter=None,
+       span=None, exact=True):
+    """`span`: (start s, end s) of the stream's first and last message."""
+    out = {"topic": topic, "schema": schema, "modality": modality, "msg_count": count, "rate_hz": rate,
+           "jitter_ms": jitter, "gaps_over_3x": gaps, "max_gap_ms": gap, "nan_count": nan}
+    if span is not None:
+        out.update(start_ns=int(span[0] * 1e9), end_ns=int(span[1] * 1e9), time_exact=exact)
+    return out
 
 
 def file(path, channels, fmt="mcap", duration=60.0, valid=True, findings=(), basic=None, error=None):
@@ -447,6 +452,118 @@ def test_evaluate_edges() -> None:
           "Parquet episodes without seconds_min: unknown, no crash")
 
 
+OVERLAP = {"streams": [{"name": "cam", "match": {"modality": "video"}},
+                       {"name": "state", "match": {"modality": "proprio"}}],
+           "dataset": {"min_stream_overlap_pct": 95}}
+
+
+def overlap(rep):
+    v = evaluate(rep, parse_requirements(OVERLAP, "t.yaml"))
+    return next(c for c in v.checks if c.id == "dataset:min_stream_overlap_pct")
+
+
+def test_overlap() -> None:
+    # The fixture from the feature request: shifting one stream leaves every per-stream number the same
+    # (rate, jitter, gaps, count) and flips only the overlap verdict.
+    def rec(shift):
+        return report([file("a.mcap", [ch("/cam", "video", rate=30, gap=33.3, jitter=0.1, span=(shift, 10 + shift)),
+                                       ch("/joints", "proprio", rate=100, gap=10, jitter=0.1, span=(0, 10))])])
+    per_stream = {"streams": [dict(CAM), {"name": "j", "match": {"modality": "proprio"}, "min_rate_hz": 50}]}
+    check(status(rec(0), per_stream) == status(rec(2), per_stream) == PASS,
+          "a 2 s shift leaves every per-stream check passing")
+    c0, c2 = overlap(rec(0)), overlap(rec(2))
+    check(c0.status == PASS and c2.status == FAIL and "66.7%" in c2.observed,
+          f"...and flips only the overlap: aligned PASS, shifted {c2.observed}")
+    check("cam 2.00-12.00 s" in c2.evidence[0] and "state 0.00-10.00 s" in c2.evidence[0],
+          f"evidence shows each stream's span: {c2.evidence[0]}")
+    c40 = overlap(rec(0.04))
+    check(c40.status == PASS and any("constant delay" in e for e in c40.evidence),
+          "a 40 ms shift is still 99% overlap: the check says it cannot see constant delays")
+
+    # A camera that stops halfway, in one file of three
+    files = [file(f"{i}.mcap", [ch("/cam", "video", span=(0, 5 if i == 1 else 10)), ch("/j", "proprio", span=(0, 10))])
+             for i in range(3)]
+    c = overlap(report(files))
+    check(c.status == FAIL and "1.mcap" in c.observed and "1 below" in c.observed,
+          f"camera stops halfway in one recording: fail, recording named ({c.observed})")
+
+    # Two cameras matching one requirement: their combined span counts
+    two = report([file("a.mcap", [ch("/cam1", "video", span=(0, 6)), ch("/cam2", "video", span=(4, 10)),
+                                  ch("/j", "proprio", span=(0, 10))])])
+    check(overlap(two).status == PASS, "two cameras that together cover the recording: pass")
+
+    # Missing stream, sampled (inexact) times, no times, unreadable files, MAT
+    check(overlap(report([file("a.mcap", [ch("/j", "proprio", span=(0, 10))])])).status == FAIL,
+          "a required stream absent from a fully read file: 0%, fail")
+    inc = report([file("a.mcap", [ch("/j", "proprio", span=(0, 10))], findings=["unknown_channels"])])
+    check(overlap(inc).status == UNKNOWN, "absent, but the stream list is incomplete: unknown")
+    inexact = report([file("a.mcap", [ch("/cam", "video", span=(0, 8), exact=False), ch("/j", "proprio", span=(0, 10))])])
+    c = overlap(inexact)
+    check(c.status == UNKNOWN and "--msgidx-budget-mb" in (c.resolve or ""),
+          "below the threshold with inexact times: unknown, with how to settle it")
+    ok_inexact = report([file("a.mcap", [ch("/cam", "video", span=(0, 10), exact=False), ch("/j", "proprio", span=(0, 10))])])
+    check(overlap(ok_inexact).status == UNKNOWN, "inexact times never give a pass")
+    notime = report([file("a.mcap", [ch("/cam", "video"), ch("/j", "proprio", span=(0, 10))])])
+    check(overlap(notime).status == UNKNOWN, "a stream without message times: unknown")
+    check(overlap(report([file("a.mat", [ch("x", "proprio")], fmt="mat")])).status == UNKNOWN,
+          "MAT files have no timestamps: unknown, not measured")
+    broken = report([file("a.mcap", [ch("/cam", "video", span=(0, 10)), ch("/j", "proprio", span=(0, 10))]),
+                     file("b.mcap", [], valid=False, error="HTTP 500")])
+    check(overlap(broken).status == UNKNOWN, "one file unreadable: unknown")
+    check(overlap_pct([(0, 0), (0, 0)]) == 100.0 and overlap_pct([(0, 0), (1, 1)]) == 0.0,
+          "single-instant streams: together 100%, apart 0%")
+
+    # Optional streams are not compared
+    opt = dict(OVERLAP, streams=OVERLAP["streams"] + [{"name": "imu", "required": False, "match": {"modality": "imu"}}])
+    rep = report([file("a.mcap", [ch("/cam", "video", span=(0, 10)), ch("/j", "proprio", span=(0, 10)),
+                                  ch("/imu", "imu", span=(0, 2))])])
+    check(evaluate(rep, parse_requirements(opt, "t")).status == PASS, "optional streams do not count toward overlap")
+
+    # Validation
+    e = errors_of({"streams": [CAM], "dataset": {"min_stream_overlap_pct": 95}})
+    check(any("at least two required streams" in x for x in e), "fewer than two required streams: rejected")
+    e = errors_of({"streams": OVERLAP["streams"], "dataset": {"min_stream_overlap": 95}})
+    check(any("did you mean 'min_stream_overlap_pct'" in x for x in e), "misspelt key gets a suggestion")
+    check(any("between 0 and 100" in x or "100" in x
+              for x in errors_of({"streams": OVERLAP["streams"], "dataset": {"min_stream_overlap_pct": 150}})),
+          "a percentage over 100 is rejected")
+
+
+def lerobot(cam_spans: dict, table_spans: list, complete=True, lr_complete=True):
+    """A LeRobot v3 report: one table with per-episode spans, one camera MP4, and meta/episodes spans."""
+    eps = {"count": len(table_spans), "complete": complete, "spans": table_spans}
+    files = [file("data/chunk-000/file-000.parquet", [ch("observation.state", "proprio", rate=30)], fmt="parquet",
+                  basic={"episodes": eps}),
+             file("videos/observation.images.top/chunk-000/file-000.mp4",
+                  [ch("observation.images.top", "video", rate=30, span=(0, 99))], fmt="mp4")]
+    r = report(files)
+    r["lerobot_episodes"] = {"cameras": {"observation.images.top": {str(k): v for k, v in cam_spans.items()}},
+                             "complete": lr_complete}
+    return r
+
+
+def test_overlap_lerobot() -> None:
+    # 3 episodes at 30 fps: 300, 150 and 90 frames (last timestamp = (n - 1) / 30)
+    table = [[0, 0.0, 299 / 30, 300], [1, 0.0, 149 / 30, 150], [2, 0.0, 89 / 30, 90]]
+    good = {0: [0.0, 10.0], 1: [10.0, 15.0], 2: [15.0, 18.0]}
+    c = overlap(lerobot(good, table))
+    check(c.status == PASS and "100.0%" in c.observed, f"LeRobot: every episode's video matches its table ({c.observed})")
+    cut = {0: [0.0, 10.0], 1: [10.0, 12.0], 2: [12.0, 15.0]}     # episode 1's video is 2 s, its table 5 s
+    c = overlap(lerobot(cut, table))
+    check(c.status == FAIL and "episode 1" in c.observed, f"LeRobot: a video cut short in episode 1 fails, named ({c.observed})")
+    missing = {0: [0.0, 10.0], 2: [15.0, 18.0]}
+    check(overlap(lerobot(missing, table)).status == UNKNOWN, "LeRobot: an episode with no video span: unknown")
+    check(overlap(lerobot(good, table, lr_complete=False)).status == UNKNOWN,
+          "LeRobot: meta/episodes partly read: unknown, never a guessed pass")
+    c = overlap(lerobot(good, table, complete=False))
+    check(c.status == UNKNOWN and "--column-budget-mb" in (c.resolve or ""), "LeRobot: table timestamps sampled: unknown")
+    r = lerobot(good, table)
+    del r["lerobot_episodes"]
+    c = overlap(r)
+    check(c.status == UNKNOWN and any("meta/episodes" in e for e in c.evidence),
+          "LeRobot without meta/episodes spans: unknown, says why")
+
+
 def test_compare_edges() -> None:
     req = parse_requirements({"streams": [CAM]}, "t")
     a = report([file("a.mcap", [ch("/cam", "video", rate=30)], duration=3600)], repo="org/a")
@@ -474,6 +591,8 @@ def main() -> None:
     test_dataset()
     test_compare()
     test_compare_edges()
+    test_overlap()
+    test_overlap_lerobot()
     test_cli()
     print("all checks passed")
 

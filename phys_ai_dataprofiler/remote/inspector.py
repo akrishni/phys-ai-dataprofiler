@@ -178,7 +178,7 @@ def inspect_mcap_remote(
                                 "written); profiled by walking its records"))
         walk = _walk_mcap(rf, msgidx_budget_bytes, log, findings)
         return build(chans=walk.chans, schemas=walk.schemas, segments=walk.segments(), counts=None,
-                     duration_s=walk.duration_s, indexed=False)
+                     duration_s=walk.duration_s, indexed=False, exact=walk.complete)
 
     try:
         footer = _read_footer(rf)
@@ -202,7 +202,7 @@ def inspect_mcap_remote(
                                 "no summary section; profiled by walking its records"))
         walk = _walk_mcap(rf, msgidx_budget_bytes, log, findings)
         return build(chans=walk.chans, schemas=walk.schemas, segments=walk.segments(), counts=None,
-                     duration_s=walk.duration_s, indexed=False)
+                     duration_s=walk.duration_s, indexed=False, exact=walk.complete)
 
     chans = {cid: _channel_info(ch) for cid, ch in summary.channels.items()}
     schemas = {sid: _schema_info(sc) for sid, sc in summary.schemas.items()}
@@ -221,21 +221,24 @@ def inspect_mcap_remote(
         # The summary stays authoritative for channels, counts and duration.
         walk = _walk_mcap(rf, msgidx_budget_bytes, log, findings)
         return build(chans=chans, schemas=schemas, segments=walk.segments(), counts=counts,
-                     duration_s=duration_s if duration_s is not None else walk.duration_s, indexed=True)
+                     duration_s=duration_s if duration_s is not None else walk.duration_s, indexed=True,
+                     exact=walk.complete)
 
     # ---- timestamps from message indexes -----------------------------------
+    indexed_chunks = [ci for ci in summary.chunk_indexes if ci.message_index_offsets and ci.message_index_length]
     ranges: list[tuple[int, int]] = []
-    for ci in summary.chunk_indexes:
-        if ci.message_index_offsets and ci.message_index_length:
-            start = min(ci.message_index_offsets.values())
-            ranges.append((start, start + ci.message_index_length))
+    for ci in indexed_chunks:
+        start = min(ci.message_index_offsets.values())
+        ranges.append((start, start + ci.message_index_length))
     total_idx = sum(e - s for s, e in ranges)
     sampled = False
     if total_idx > msgidx_budget_bytes and ranges:
-        # Keep an evenly spaced subset of chunks that fits the budget.
+        # Keep an evenly spaced subset of chunks that fits the budget, plus the chunks that can hold each
+        # channel's first and last message, so every channel's time span stays exact.
         keep = max(1, int(len(ranges) * msgidx_budget_bytes / total_idx))
         step = len(ranges) / keep
-        ranges = [ranges[int(i * step)] for i in range(keep)]
+        chosen = {int(i * step) for i in range(keep)} | _edge_chunks(indexed_chunks)
+        ranges = [ranges[i] for i in sorted(chosen)]
         sampled = True
 
     # One run per channel, or, when chunks are sampled, one run per chunk: sampled chunks
@@ -263,15 +266,37 @@ def inspect_mcap_remote(
         findings.append(Finding("info", "sampled_message_index", None,
                                 f"message indexes sampled ({len(ranges)} chunks) to stay under "
                                 f"{msgidx_budget_bytes // (1024 * 1024)} MB; jitter/gap stats are estimates"))
+    # Every channel's edge chunks were read (or all chunks), so spans are exact; without message
+    # indexes there are no per-channel times at all.
     return build(chans=chans, schemas=schemas, segments=segments, counts=counts,
-                 duration_s=duration_s, indexed=True)
+                 duration_s=duration_s, indexed=True, exact=bool(ranges))
+
+
+def _edge_chunks(chunks) -> set[int]:
+    """Indexes of the chunks that may hold some channel's first or last message.
+
+    A chunk index lists which channels it holds (message_index_offsets) and its time range. A channel's
+    first message is in the chunk with its earliest start, or in any other chunk of that channel starting
+    no later than that chunk ends (chunks can overlap in time); likewise for the last message.
+    """
+    by_channel: dict[int, list[int]] = {}
+    for i, ci in enumerate(chunks):
+        for cid in ci.message_index_offsets:
+            by_channel.setdefault(cid, []).append(i)
+    out: set[int] = set()
+    for idx in by_channel.values():
+        first = min(idx, key=lambda i: chunks[i].message_start_time)
+        last = max(idx, key=lambda i: chunks[i].message_end_time)
+        out |= {i for i in idx if chunks[i].message_start_time <= chunks[first].message_end_time}
+        out |= {i for i in idx if chunks[i].message_end_time >= chunks[last].message_start_time}
+    return out
 
 
 def _mcap_result(
     rf: RangeFile, url: str, header_info, footer_info, *,
     chans: dict[int, ChannelInfo], schemas: dict[int, SchemaInfo], segments: dict[int, list[list[int]]],
     counts: dict[int, int] | None, duration_s: float | None, indexed: bool,
-    findings: list[Finding], t0: float,
+    findings: list[Finding], t0: float, exact: bool = True,
 ) -> tuple[McapInspectionResult, RichProfile]:
     """Build the result and profile from channels, timestamp runs and (when known) summary counts."""
     channel_stats: dict[int, dict] = {}
@@ -289,6 +314,7 @@ def _mcap_result(
             "schema": schema.name if schema else "unknown",
             "segments": segs,
             "count": count,
+            "exact": exact,
         }
     profiles, ch_findings = profile_mcap_channels(channel_stats)
 
@@ -322,6 +348,7 @@ class _McapWalk:
     chans: dict[int, ChannelInfo] = field(default_factory=dict)
     timestamps: dict[int, list[int]] = field(default_factory=dict)
     chunk_bounds: list[tuple[int, int]] = field(default_factory=list)
+    complete: bool = True          # False when the walk stopped early or skipped chunk bodies it needed
 
     def segments(self) -> dict[int, list[list[int]]]:
         return {cid: [sorted(ts)] for cid, ts in self.timestamps.items()}
@@ -425,6 +452,9 @@ def _walk_mcap(rf: RangeFile, budget: int, log, findings: list[Finding]) -> _Mca
             end = next_off
         off = end
 
+    # A cut-off file was read to its end, so what it holds is complete; a budget stop or an undecoded
+    # chunk (that may hold a channel's messages) is not.
+    walk.complete = stopped != "budget" and not undecoded
     if stopped == "budget":
         findings.append(Finding("info", "partial_scan", None,
                                 f"walk stopped at {off / size:.0%} of the file to stay under "

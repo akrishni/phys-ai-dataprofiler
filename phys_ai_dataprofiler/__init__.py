@@ -2,7 +2,7 @@
 
 Copyright (c) 2026 Anand Krishniyer. MIT License."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector, McapInspectionResult  # noqa: F401
 from phys_ai_dataprofiler.inspectors.mat import MatFileInspector, MatInspectionResult  # noqa: F401

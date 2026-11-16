@@ -583,7 +583,195 @@ def _check_dataset(req: Requirements, views: list[_FileView], report: dict) -> l
         st = PASS if pct <= d.max_unindexed_files_pct else FAIL
         add("max_unindexed_files_pct", st, f"<= {_fmt(d.max_unindexed_files_pct)}% unindexed or truncated",
             f"{sum(fv.n_files for fv in unidx)} of {n} ({pct:.1f}%)", [fv.path for fv in unidx[:5]])
+
+    if d.min_stream_overlap_pct is not None:
+        checks.append(_check_overlap(req, views, report))
     return checks
+
+
+# --------------------------------------------------------------------------- #
+# Stream overlap
+# --------------------------------------------------------------------------- #
+
+def overlap_pct(spans: list[tuple[float, float]]) -> float:
+    """Time when every span is active, as a percentage of the time when any is."""
+    lo, hi = max(a for a, _ in spans), min(b for _, b in spans)
+    union = max(b for _, b in spans) - min(a for a, _ in spans)
+    if union <= 0:
+        return 100.0 if lo <= hi else 0.0      # all streams a single instant: together, or not
+    return 100.0 * max(0.0, hi - lo) / union
+
+
+def _stream_span(sr: StreamRequirement, channels: list[dict]) -> tuple[float, float, bool] | None:
+    """(start s, end s, exact) of the channels matching `sr`, combined; None when none match or have times."""
+    got = [c for c in channels if sr.match.matches(c) and c.get("start_ns") is not None and c.get("end_ns") is not None]
+    if not got:
+        return None
+    return (min(c["start_ns"] for c in got) / 1e9, max(c["end_ns"] for c in got) / 1e9,
+            all(c.get("time_exact") for c in got))
+
+
+def _fmt_span(name: str, a: float, b: float, base: float) -> str:
+    return f"{name} {a - base:.2f}-{b - base:.2f} s"
+
+
+@dataclass
+class _Recording:
+    label: str
+    pct: float | None
+    exact: bool
+    detail: str
+
+
+def _overlap_recordings(req: Requirements, views: list[_FileView], report: dict
+                        ) -> tuple[list[_Recording], list[str], list[str]]:
+    """Overlap per recording. Returns (recordings, reasons some recordings could not be measured, resolve hints)."""
+    required = [sr for sr in req.streams if sr.required]
+    recs: list[_Recording] = []
+    why: list[str] = []
+    fix: list[str] = []
+
+    # ---- recordings with every stream in one file: MCAP, ROS 1 and ROS 2 bags ------------------
+    for fv in views:
+        if fv.format not in ("mcap", "bag1", "bag2"):
+            continue
+        if not fv.valid:
+            recs.append(_Recording(fv.path, None, False, f"file not profiled: {fv.error or 'invalid'}"))
+            continue
+        spans, missing, no_time = {}, [], []
+        for sr in required:
+            if not any(sr.match.matches(c) for c in fv.channels):
+                missing.append(sr.name)
+                continue
+            sp = _stream_span(sr, fv.channels)
+            if sp is None:
+                no_time.append(sr.name)
+            else:
+                spans[sr.name] = sp
+        if no_time:
+            recs.append(_Recording(fv.path, None, False, f"no message times for {', '.join(no_time)}"))
+            continue
+        if missing:
+            # A stream absent from a file that was fully read is a definite 0% (the stream check also fails);
+            # from a file whose stream list may be incomplete it is undecided.
+            sure = not (fv.finding_types & INCOMPLETE_STREAM_LIST)
+            recs.append(_Recording(fv.path, 0.0 if sure else None, sure, f"{', '.join(missing)} absent"))
+            continue
+        base = min(a for a, _, _ in spans.values())
+        pct = overlap_pct([(a, b) for a, b, _ in spans.values()])
+        exact = all(e for _, _, e in spans.values())
+        recs.append(_Recording(fv.path, pct, exact,
+                               ", ".join(_fmt_span(k, a, b, base) for k, (a, b, _) in spans.items())))
+    if any(not r.exact and r.pct is not None for r in recs):
+        fix.append("raise --msgidx-budget-mb so each stream's first and last message is read")
+
+    # ---- LeRobot: per episode, the table's span against each required camera's video span --------------
+    tables = [fv for fv in views if fv.format == "parquet" and (fv.basic.get("episodes") or {}).get("spans")]
+    videos = [fv for fv in views if fv.format == "mp4"]
+    if tables and videos:
+        lr = report.get("lerobot_episodes")
+        cam_reqs = [sr for sr in required if any(sr.match.matches(c) for fv in videos for c in fv.channels)]
+        data_reqs = [sr for sr in required if sr not in cam_reqs]
+        if not cam_reqs:
+            pass                             # no required camera: nothing in the videos to compare
+        elif not lr or not lr.get("cameras"):
+            why.append("LeRobot videos are in scope, but their per-episode spans (meta/episodes) were not read")
+            fix.append("profile with --requirements so meta/episodes is read, and keep meta/episodes/* in scope "
+                       "of the Hub listing")
+            recs.append(_Recording("LeRobot episodes", None, False, "per-episode video spans unknown"))
+        else:
+            recs += _lerobot_overlap(cam_reqs, data_reqs, tables, videos, lr, why, fix)
+    return recs, why, fix
+
+
+def _lerobot_overlap(cam_reqs, data_reqs, tables, videos, lr: dict, why: list[str], fix: list[str]) -> list[_Recording]:
+    """Episode by episode: each required camera's span (to - from, aligned at the episode's first frame)
+    against the table's (first to last timestamp). LeRobot timestamps restart at 0 every episode and the
+    video span starts at the episode's first frame, so the two share a start; overlap measures their length
+    mismatch: a video cut short, or longer than the episode it belongs to."""
+    table: dict[int, tuple[float, float, int]] = {}
+    complete = True
+    for fv in tables:
+        ep = fv.basic["episodes"]
+        complete &= bool(ep.get("complete"))
+        for e, a, b, n in ep["spans"]:
+            table[int(e)] = (float(a), float(b), int(n))
+    # JSON reports store episode numbers as string keys; normalise to int.
+    lr_cams = {cam: {int(k): v for k, v in eps.items()} for cam, eps in (lr.get("cameras") or {}).items()}
+    # Which camera files each requirement matched, by camera name (the MP4 channel topic).
+    cams: dict[str, list[str]] = {}
+    for sr in cam_reqs:
+        names = sorted({c["topic"] for fv in videos for c in fv.channels if sr.match.matches(c)})
+        cams[sr.name] = [n for n in names if n in lr_cams]
+    out: list[_Recording] = []
+    for sr_name, names in cams.items():
+        if not names:
+            why.append(f"no per-episode spans for the cameras matching '{sr_name}' in meta/episodes")
+    lr_complete = bool(lr.get("complete"))
+    if not lr_complete:
+        fix.append("raise --episodes-budget-mb so every meta/episodes table is read")
+    if not complete:
+        fix.append("raise --column-budget-mb so every episode's timestamps are read")
+    fps_frame = None
+    for e, (a, b, n) in sorted(table.items()):
+        spans = {"table": (a, b)}
+        for sr_name, names in cams.items():
+            got = [lr_cams[c][e] for c in names if e in lr_cams[c]]
+            if got:
+                # The camera's video covers [0, to - from) from the episode start; its last frame starts one
+                # frame before the end. Use the table's frame interval for that frame.
+                if fps_frame is None and n > 1:
+                    fps_frame = (b - a) / (n - 1)
+                dur = max(t - f for f, t in got)
+                spans[sr_name] = (a, a + max(0.0, dur - (fps_frame or 0.0)))
+        if len(spans) < 2:
+            out.append(_Recording(f"episode {e}", None, False, "no video span for this episode"))
+            continue
+        pct = overlap_pct(list(spans.values()))
+        detail = ", ".join(_fmt_span(k, x, y, a) for k, (x, y) in spans.items())
+        out.append(_Recording(f"episode {e}", pct, complete and lr_complete, detail))
+    return out
+
+
+def _check_overlap(req: Requirements, views: list[_FileView], report: dict) -> Check:
+    limit = req.dataset.min_stream_overlap_pct
+    required = [sr.name for sr in req.streams if sr.required]
+    expected = f">= {_fmt(limit)}% of each recording with every required stream ({', '.join(required)}) present"
+    recs, why, fix = _overlap_recordings(req, views, report)
+    if not recs:
+        why = why or ["no file with timestamps for these streams (MCAP, ROS bags, LeRobot table + videos)"]
+        return Check(id="dataset:min_stream_overlap_pct", label="min_stream_overlap_pct", status=UNKNOWN,
+                     required=True, expected=expected, observed="no recording to measure", evidence=why,
+                     resolve="; ".join(dict.fromkeys(fix)) or None, headline="not measured")
+    measured = [r for r in recs if r.pct is not None]
+    below = [r for r in measured if r.pct < limit - PRECISION * limit]
+    sure_below = [r for r in below if r.exact]
+    undecided = [r for r in recs if r.pct is None or (not r.exact and r not in below)]
+    if sure_below:
+        status = FAIL
+    elif below or undecided:
+        status = UNKNOWN
+    else:
+        status = PASS
+    worst = min(measured, key=lambda r: r.pct) if measured else None
+    observed = (f"worst {worst.pct:.1f}% ({worst.label}) over {len(recs)} recording(s)" if worst
+                else f"{len(recs)} recording(s), none measurable")
+    if below:
+        observed += f"; {len(below)} below {_fmt(limit)}%"
+    shown = sorted(recs, key=lambda r: (r.pct is not None, r.pct if r.pct is not None else 0))[:5]
+    evidence = [f"{'?' if r.pct is None else f'{r.pct:.1f}%'}{'' if r.exact or r.pct is None else ' (bounds)'} "
+                f"{r.label}: {r.detail}" for r in shown]
+    if len(recs) > len(shown):
+        evidence.append(f"... {len(recs) - len(shown)} more recording(s)")
+    evidence += why
+    evidence.append("note: overlap shows streams missing for part of a recording; a constant delay between "
+                    "streams (one sensor's clock behind) does not change it")
+    if undecided and status != FAIL and not fix:
+        fix.append("fix or exclude the recordings that could not be measured")
+    return Check(id="dataset:min_stream_overlap_pct", label="min_stream_overlap_pct", status=status, required=True,
+                 expected=expected, observed=observed, evidence=evidence,
+                 resolve="; ".join(dict.fromkeys(fix)) if status == UNKNOWN and fix else None,
+                 headline=f"{worst.pct:.1f}% worst" if worst else "not measured")
 
 
 # --------------------------------------------------------------------------- #

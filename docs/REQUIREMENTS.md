@@ -56,6 +56,7 @@ dataset:                        # what the whole selection must add up to
   same_schema_across_files: true
   max_invalid_files_pct: 0      # files that could not be read
   max_unindexed_files_pct: 5    # MCAP/bag files with no index, or truncated
+  min_stream_overlap_pct: 95    # per recording, the required streams record together (see below)
 ```
 
 The file is validated before any network traffic. Every problem is reported at once, with suggestions
@@ -109,6 +110,36 @@ unknown when the files still undecided could bring it there, and fail when they 
 file with a time range. The report keeps only the shortest, median and longest episode per Parquet file,
 so `min_episode_seconds` on LeRobot data passes only when the shortest episode clears it; otherwise it is
 unknown.
+
+## Stream overlap
+
+`min_stream_overlap_pct` checks that the required streams cover the same time in each recording. Every
+stream can pass its own rate, jitter and gap checks while the set is still unusable: a camera that stops
+halfway, joint state that starts 10 s late, or topics from two different sessions in one file.
+
+For each recording, each required stream's span runs from its first to its last message. When several
+channels match one requirement, their spans combine. The overlap is the time when every span is active,
+divided by the time when any is. A camera recording 2-12 s and joints recording 0-10 s overlap 8 of 12
+seconds, 66.7%. The check passes when every recording reaches the threshold, and the evidence lists the
+worst recordings with each stream's span.
+
+- **What counts as a recording:**
+  - **MCAP, ROS 1 bag, ROS 2 `.db3`:** each file. Spans come from the same message indexes the rate
+    checks read, so nothing more is downloaded. When indexes are sampled, each stream's first and last
+    chunk is still read, so its span stays exact.
+  - **LeRobot:** each episode, comparing the table's span with each camera's video span. LeRobot v3
+    packs many episodes into each video, so the per-episode video spans come from `meta/episodes`. It
+    is read only when this key is set, and only its timing columns: 104 KB for `lerobot/pusht`, 6.6 MB
+    for `lerobot/droid_1.0.1` (95,658 episodes). It's capped by `--episodes-budget-mb` (default 16).
+    Both timelines start at the episode's first frame, so the check finds videos cut short, or longer
+    than their episode.
+- **Unknown, never a guessed pass:** when a stream's first or last message may not have been read (a
+  walk stopped at `--msgidx-budget-mb`, sampled ROS 2 pages, a sampled `meta/episodes`). Also when a
+  stream has no message times (MAT files), or a file couldn't be profiled. A required stream that is
+  absent from a fully read file is 0%.
+- **What it does not see:** a constant delay between streams. A camera whose frames arrive 40 ms late
+  still overlaps the joints 99%, and its own timestamps look regular. Catching that needs the sensor's
+  capture time as well as the recorder's, which the profiler does not read.
 
 ## Comparing datasets
 

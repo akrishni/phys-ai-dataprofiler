@@ -104,7 +104,10 @@ def _url(rf: RangeFile) -> str:
 
 def _profile(rf: RangeFile, fmt: str, indexed: bool, conns: dict[int, BagConnection],
              segments: dict[int, list[list[int]]], duration_s: float | None,
-             findings: list[Finding], t0: float, complete: bool) -> RichProfile:
+             findings: list[Finding], t0: float, complete: bool,
+             exact: bool | set[int] = True) -> RichProfile:
+    """`exact`: whether each connection's first and last timestamps were read (True/False for all,
+    or the set of connection ids for which they were)."""
     stats: dict[int, dict] = {}
     for cid in sorted(conns.keys() | segments.keys()):
         c = conns.get(cid)
@@ -113,7 +116,8 @@ def _profile(rf: RangeFile, fmt: str, indexed: bool, conns: dict[int, BagConnect
         if count == 0 and complete:
             continue
         stats[cid] = {"topic": c.topic if c else f"<connection {cid}>",
-                      "schema": c.type if c else "unknown", "segments": segs, "count": count}
+                      "schema": c.type if c else "unknown", "segments": segs, "count": count,
+                      "exact": cid in exact if isinstance(exact, set) else exact}
     channels, ch_findings = profile_mcap_channels(stats)
     if duration_s:
         for p in channels:
@@ -122,6 +126,11 @@ def _profile(rf: RangeFile, fmt: str, indexed: bool, conns: dict[int, BagConnect
     return RichProfile(path=_url(rf), format=fmt, size_bytes=rf.size, indexed=indexed,
                        duration_s=duration_s, time_base="ros_time_ns" if duration_s is not None else None,
                        channels=channels, findings=findings + ch_findings, inspect_cost_s=time.time() - t0)
+
+
+# A topic sampled in the first/last leaf counts as spanning the whole bag only when its edge rows are within
+# this of the bag's own first/last timestamp (from timestamp_idx): one second, a generous frame interval.
+_EDGE_SLACK_NS = 1_000_000_000
 
 
 def _sample_evenly(items: list, keep: int) -> list:
@@ -349,7 +358,10 @@ def inspect_bag1_remote(rf: RangeFile, msgidx_budget_bytes: int = 64 << 20, work
     total_idx = sum(e - s for s, e, _ in ranges)
     sampled = False
     if total_idx > msgidx_budget_bytes and ranges:
-        ranges = _sample_evenly(ranges, max(1, int(len(ranges) * msgidx_budget_bytes / total_idx)))
+        # An evenly spaced sample, plus each connection's first and last chunk so its span stays exact.
+        keep = max(1, int(len(ranges) * msgidx_budget_bytes / total_idx))
+        chosen = {int(i * len(ranges) / keep) for i in range(keep)} | _edge_chunks1(chunks)
+        ranges = [ranges[i] for i in sorted(chosen)]
         sampled = True
 
     segments: dict[int, list[list[int]]] = {}
@@ -402,6 +414,23 @@ def inspect_bag1_remote(rf: RangeFile, msgidx_budget_bytes: int = 64 << 20, work
                                 f"index data sampled ({len(ranges)} of {len(chunks)} chunks) to stay under "
                                 f"{msgidx_budget_bytes // (1 << 20)} MB; jitter/gap stats are estimates"))
     return res, _profile(rf, "bag1", True, conns, segments, res.duration_s, findings, t0, True)
+
+
+def _edge_chunks1(chunks: list[_ChunkInfo]) -> set[int]:
+    """Indexes of the chunks that may hold some connection's first or last message (chunks can overlap
+    in time, so every chunk of that connection reaching past the earliest one's end is included)."""
+    by_conn: dict[int, list[int]] = {}
+    for i, ci in enumerate(chunks):
+        for conn, n in ci.counts.items():
+            if n:
+                by_conn.setdefault(conn, []).append(i)
+    out: set[int] = set()
+    for idx in by_conn.values():
+        first = min(idx, key=lambda i: chunks[i].start_ns)
+        last = max(idx, key=lambda i: chunks[i].end_ns)
+        out |= {i for i in idx if chunks[i].start_ns <= chunks[first].end_ns}
+        out |= {i for i in idx if chunks[i].end_ns >= chunks[last].start_ns}
+    return out
 
 
 def _parse_index_region(buf: bytes, ci: _ChunkInfo, strict: bool = True) -> dict[int, list[int]] | None:
@@ -532,7 +561,8 @@ def _walk_bag1(rf: RangeFile, res: BagInspectionResult, budget: int, log, findin
         res.start_ns, res.end_ns = min(all_ts), max(all_ts)
         res.duration_s = (res.end_ns - res.start_ns) / 1e9
     segments = {cid: [sorted(ts)] for cid, ts in flat.items()}
-    return res, _profile(rf, "bag1", False, conns, segments, res.duration_s, findings, t0, stopped is None)
+    return res, _profile(rf, "bag1", False, conns, segments, res.duration_s, findings, t0, stopped is None,
+                         exact=stopped != "budget")
 
 
 # --------------------------------------------------------------------------- #
@@ -887,6 +917,12 @@ def inspect_bag2_remote(rf: RangeFile, msgidx_budget_bytes: int = 64 << 20, work
                         groups.append([(no, run)])
                 room = max(1, (budget - spent) // db.page_size)
                 keep = _sample_evenly(groups, max(1, int(len(groups) * room / len(level))))
+                # The first and last pages hold the earliest and latest rows (rowid follows write order),
+                # so keeping them pins every topic that appears near the start and end of the recording.
+                if groups[0] not in keep:
+                    keep = [groups[0]] + keep
+                if groups[-1] not in keep:
+                    keep = keep + [groups[-1]]
                 level = []
                 for g in keep:
                     level.extend((no, next_run) for no, _ in g)
@@ -995,4 +1031,15 @@ def inspect_bag2_remote(rf: RangeFile, msgidx_budget_bytes: int = 64 << 20, work
         res.leaves_total = len(leaves)
     if res.message_count == 0:
         findings.append(Finding("warn", "empty_file", None, "bag has no messages"))
-    return res, _profile(rf, "bag2", True, conns, segments, res.duration_s, findings, t0, not sampled)
+    exact: bool | set[int] = True
+    if sampled:
+        # A topic's span is exact when its rows appear in the very first and very last leaf read, which
+        # hold the recording's first and last rows; otherwise its first/last message may be unread.
+        first_run = leaves[0][1] if leaves else None
+        last_run = leaves[-1][1] if leaves else None
+        exact = {tid for tid, runs in seg_runs.items() if first_run in runs and last_run in runs}
+        if start_ns is not None and end_ns is not None:
+            exact = {tid for tid in exact
+                     if min(seg_runs[tid][first_run]) <= start_ns + _EDGE_SLACK_NS
+                     and max(seg_runs[tid][last_run]) >= end_ns - _EDGE_SLACK_NS}
+    return res, _profile(rf, "bag2", True, conns, segments, res.duration_s, findings, t0, not sampled, exact)

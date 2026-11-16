@@ -58,6 +58,7 @@ from phys_ai_dataprofiler.remote.range_file import HfRangeFile
 from phys_ai_dataprofiler.remote.inspector import inspect_mcap_remote, inspect_mat_remote, sniff_format
 from phys_ai_dataprofiler.remote.parquet import inspect_parquet
 from phys_ai_dataprofiler.remote.rosbag import inspect_bag1_remote, inspect_bag2_remote
+from phys_ai_dataprofiler.remote.lerobot_meta import episode_tables, read_spans
 from phys_ai_dataprofiler.remote.mp4 import declared_videos, inspect_mp4, recording_seconds, video_stream_name
 from phys_ai_dataprofiler.remote.range_file import LocalRangeFile
 
@@ -127,6 +128,7 @@ class RunReport:
     totals: dict
     run_cost_s: float
     verdict: dict | None = None            # set when --requirements is given
+    lerobot_episodes: dict | None = None   # per-episode video spans (meta/episodes), when overlap is checked
 
 
 # --------------------------------------------------------------------------- #
@@ -827,14 +829,21 @@ def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
         channels = rich.get("channels") or []
         if channels and f.detected_format in ("mcap", "bag1", "bag2", "mp4"):
             L.append("")
-            L.append("| Topic | Schema | Modality | Count | Rate (Hz) | Jitter (ms) | Gaps>3x | Max gap (ms) |")
-            L.append("|---|---|---|---|---|---|---|---|")
+            starts = [c["start_ns"] for c in channels if c.get("start_ns") is not None]
+            t0 = min(starts) if starts else None
+            L.append("| Topic | Schema | Modality | Count | Rate (Hz) | Jitter (ms) | Gaps>3x | Max gap (ms) | Span (s) |")
+            L.append("|---|---|---|---|---|---|---|---|---|")
             for c in channels[:200]:
                 rate = f"{c['rate_hz']:.2f}" if c.get("rate_hz") is not None else "-"
                 jit = f"{c['jitter_ms']:.2f}" if c.get("jitter_ms") is not None else "-"
                 mg = f"{c['max_gap_ms']:.1f}" if c.get("max_gap_ms") is not None else "-"
+                span = "-"
+                if t0 is not None and c.get("start_ns") is not None and c.get("end_ns") is not None:
+                    # Relative to the file's first message; "~" marks bounds (part of the file unread).
+                    span = (f"{'' if c.get('time_exact') else '~'}{(c['start_ns'] - t0) / 1e9:.2f}-"
+                            f"{(c['end_ns'] - t0) / 1e9:.2f}")
                 L.append(f"| `{c['topic']}` | {c['schema']} | {c.get('modality') or '-'} | {c['msg_count']:,} | "
-                         f"{rate} | {jit} | {c.get('gaps_over_3x', 0)} | {mg} |")
+                         f"{rate} | {jit} | {c.get('gaps_over_3x', 0)} | {mg} | {span} |")
         elif channels and f.detected_format == "mat":
             nan_rows = [c for c in channels if c.get("nan_count")]
             if nan_rows:
@@ -918,6 +927,7 @@ def run(args: argparse.Namespace) -> RunReport:
     skipped: list[dict] = []
     reports: list[FileReport] = []
     files_listed = 0
+    remote_files: list[RemoteFile] = []
     selected: list[RemoteFile] = []
     downloaded = 0
 
@@ -1045,6 +1055,10 @@ def run(args: argparse.Namespace) -> RunReport:
             except OSError:
                 pass
 
+    lerobot_episodes = None
+    if getattr(args, "need_episode_spans", False) and any(r.detected_format == "mp4" for r in reports):
+        lerobot_episodes = _episode_spans(connector, remote_files, local_root, args, log)
+
     return RunReport(
         repo_id=args.repo_id,
         repo_type=args.repo_type,
@@ -1062,7 +1076,28 @@ def run(args: argparse.Namespace) -> RunReport:
         files=reports,
         totals=build_totals(reports),
         run_cost_s=round(time.time() - t_start, 2),
+        lerobot_episodes=lerobot_episodes,
     )
+
+
+def _episode_spans(connector, remote_files, local_root: Path, args, log) -> dict:
+    """LeRobot v3 per-episode video spans from meta/episodes, for the stream overlap check."""
+    budget = int(args.episodes_budget_mb * 1024 * 1024)
+    try:
+        if connector is not None:
+            paths = episode_tables([f.path for f in remote_files])
+            out = read_spans(lambda p: connector.open_range(RemoteFile(p, None), block_size=args.block_kb * 1024),
+                             paths, budget, workers=args.workers, log=log)
+        else:
+            paths = episode_tables([p.relative_to(local_root).as_posix() for p in local_root.rglob("*.parquet")])
+            out = read_spans(lambda p: LocalRangeFile(local_root / p), paths, budget, workers=args.workers, log=log)
+    except Exception as exc:
+        log(f"Could not read meta/episodes: {exc}")
+        return {"cameras": {}, "length": {}, "complete": False, "error": str(exc)}
+    if paths:
+        log(f"meta/episodes: video spans for {sum(len(v) for v in out['cameras'].values())} camera-episode(s) "
+            f"from {out['files_read']}/{out['files_total']} table(s), {_human_size(out['bytes'])}")
+    return out
 
 
 def write_reports(run_report: RunReport, report_dir: Path, basename: str | None, log,
@@ -1108,6 +1143,9 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     mode.add_argument("--column-budget-mb", type=float, default=16,
                       help="Max bytes of Parquet timestamp/episode columns to read per file for timing; "
                            "beyond this, row groups are sampled")
+    mode.add_argument("--episodes-budget-mb", type=float, default=16,
+                      help="Max bytes of LeRobot meta/episodes columns to read for the stream overlap check "
+                           "(only read when a requirements file sets dataset.min_stream_overlap_pct)")
     mode.add_argument("--workers", type=int, default=16, help="Parallel range requests per file")
     mode.add_argument("--block-kb", type=int, default=64, help="Block size for cached range reads")
 
@@ -1167,6 +1205,7 @@ def profile_main(args: argparse.Namespace) -> int:
             print(str(exc), file=sys.stderr)
             return 2
         _apply_requirements_scope(args, req)
+        args.need_episode_spans = req.dataset.min_stream_overlap_pct is not None
     try:
         run_report = run(args)
     except NothingToProfile as exc:

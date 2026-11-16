@@ -46,6 +46,11 @@ class ChannelProfile:
     gaps_over_3x: int
     max_gap_ms: float | None
     nan_count: int = 0
+    # First and last message time (ns, the file's own clock). time_exact is False when these are only
+    # bounds: part of the file was not read (a walk stopped at the budget, sampled SQLite pages).
+    start_ns: int | None = None
+    end_ns: int | None = None
+    time_exact: bool = False
 
 
 @dataclass
@@ -113,8 +118,9 @@ def mat_channel_profile(name: str, shape: tuple, dtype: str, nan_count: int) -> 
 def profile_mcap_channels(channel_stats: Dict[int, dict]) -> tuple:
     """Build ChannelProfiles and Findings from per-channel timestamp lists.
 
-    channel_stats maps channel id -> {"topic", "schema", "segments", "count"},
-    where "segments" is a list of sorted runs of timestamps (see timing_stats).
+    channel_stats maps channel id -> {"topic", "schema", "segments", "count"} and optionally
+    "exact" (default True): whether the segments include the channel's first and last message, so its
+    start_ns/end_ns are exact. "segments" is a list of sorted runs of timestamps (see timing_stats).
     Shared by the local (full read) and remote (message-index) inspectors so
     both produce identical statistics for the same timestamps.
     """
@@ -132,6 +138,8 @@ def profile_mcap_channels(channel_stats: Dict[int, dict]) -> tuple:
             channel_start_times[topic] = min(seg[0] for seg in segments)
 
         rate_hz, jitter_ms, gaps_over_3x, max_gap_ms = timing_stats(segments)
+        start_ns = min(seg[0] for seg in segments) if segments else None
+        end_ns = max(seg[-1] for seg in segments) if segments else None
 
         modality = RichInspector._detect_modality(schema, topic)
 
@@ -160,6 +168,9 @@ def profile_mcap_channels(channel_stats: Dict[int, dict]) -> tuple:
             gaps_over_3x=gaps_over_3x,
             max_gap_ms=max_gap_ms,
             nan_count=0,  # Would need to parse message data
+            start_ns=int(start_ns) if start_ns is not None else None,
+            end_ns=int(end_ns) if end_ns is not None else None,
+            time_exact=bool(segments) and bool(stats.get("exact", True)),
         ))
 
         if gaps_over_3x > 0 and max_gap_ms and max_gap_ms > 100:

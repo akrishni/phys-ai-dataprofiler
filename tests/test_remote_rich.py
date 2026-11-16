@@ -142,6 +142,8 @@ def main() -> None:
         check("nan_check_skipped" in findings(prof), "MAT NaN scan can be disabled")
 
     mcap_edge_cases()
+    span_cases()
+    shifted_stream_case()
     mat_edge_cases()
 
 
@@ -188,6 +190,107 @@ def mcap_edge_cases() -> None:
     junk.write_bytes(np.random.default_rng(3).bytes(500))
     res, prof, _ = remote(junk)
     check(not res.is_mcap and "bad_magic" in findings(prof), "random bytes named .mcap: rejected, not parsed")
+
+
+def spans(prof) -> dict:
+    return {c.topic: (c.start_ns, c.end_ns, c.time_exact) for c in prof.channels}
+
+
+def span_cases() -> None:
+    """Each stream's first and last message time, exact even when message indexes are sampled."""
+    ms = 10_000_000
+    # /a runs 0-10 s, /late from 3 s to about 8 s, /tail only in the last 0.1 s.
+    msgs = ([(0, k * ms) for k in range(1000)] + [(1, 3_000_000_000 + k * 2 * ms) for k in range(250)]
+            + [(2, 9_900_000_000 + k * ms) for k in range(5)])
+    path = TMP / "spans.mcap"
+    with path.open("wb") as f:
+        w = Writer(f, chunk_size=2000)
+        w.start("test", "test")
+        sc = w.register_schema("S", "jsonschema", b"{}")
+        ids = [w.register_channel(t, "json", sc) for t in ("/a", "/late", "/tail")]
+        for ci, t in sorted(msgs, key=lambda m: m[1]):
+            w.add_message(ids[ci], log_time=t, publish_time=t, data=b"{}" * 20)
+        w.finish()
+    want = {"/a": (0, 999 * ms, True), "/late": (3_000_000_000, 3_000_000_000 + 249 * 2 * ms, True),
+            "/tail": (9_900_000_000, 9_940_000_000, True)}
+    _, prof, _ = remote(path)
+    check(spans(prof) == want, f"MCAP: first/last message per stream, exact: {spans(prof)}")
+    full = {c.topic: (c.start_ns, c.end_ns) for c in RichInspector(str(path)).inspect().channels}
+    check(full == {k: v[:2] for k, v in want.items()}, "the full read agrees")
+    _, prof, rf = remote(path, msgidx_budget_bytes=3000)
+    check("sampled_message_index" in findings(prof) and spans(prof) == want,
+          f"sampled message indexes still read each stream's edge chunks: spans exact ({rf.requests} requests)")
+
+    # Overlapping chunks: a stream's first message can sit in a chunk that does not start first.
+    ov = TMP / "overlap_chunks.mcap"
+    with ov.open("wb") as f:
+        w = Writer(f, chunk_size=10**9)
+        w.start("test", "test")
+        sc = w.register_schema("S", "jsonschema", b"{}")
+        a, b = w.register_channel("/a", "json", sc), w.register_channel("/b", "json", sc)
+        for t in range(100, 200):
+            w.add_message(a, log_time=t * ms, publish_time=t * ms, data=b"{}")
+        w.add_message(b, log_time=5 * ms, publish_time=5 * ms, data=b"{}")   # written late, timestamped early
+        w._Writer__finalize_chunk()      # end the first chunk here, so /b's early message sits in chunk 1
+        for t in range(200, 300):
+            w.add_message(a, log_time=t * ms, publish_time=t * ms, data=b"{}")
+        w.finish()
+    _, prof, _ = remote(ov)
+    check(spans(prof)["/a"][:2] == (100 * ms, 299 * ms) and spans(prof)["/b"][:2] == (5 * ms, 5 * ms),
+          "messages written out of time order across chunks: spans still exact")
+
+    # A truncated MCAP walked to its end is exact; a walk stopped by the budget is not.
+    data = path.read_bytes()
+    cut = TMP / "spans_cut.mcap"
+    cut.write_bytes(data[: len(data) * 2 // 3])
+    _, prof, _ = remote(cut)
+    seen = [c for c in prof.channels if c.msg_count]
+    check(seen and all(c.time_exact for c in seen) and spans(prof)["/a"][0] == 0,
+          "truncated file walked to its end: spans exact for the messages that survived")
+    big = TMP / "spans_cut_big.mcap"
+    full_big = mcap_file("spans_big", n=20000)
+    big.write_bytes(full_big.read_bytes()[: full_big.stat().st_size * 9 // 10])
+    _, prof, _ = remote(big, msgidx_budget_bytes=50_000)
+    check("partial_scan" in findings(prof) and prof.channels and not any(c.time_exact for c in prof.channels),
+          "walk stopped by the budget: spans marked inexact")
+
+
+def shifted_stream_case() -> None:
+    """The feature request's fixture, end to end: real MCAP files through the inspector and the verdict.
+    Shifting one stream changes no per-stream number and flips only the overlap check."""
+    from phys_ai_dataprofiler.connectors.huggingface import _to_jsonable
+    from phys_ai_dataprofiler.evaluate import evaluate
+    from phys_ai_dataprofiler.requirements import parse_requirements
+
+    def rec(name: str, shift_s: float) -> Path:
+        path = TMP / f"{name}.mcap"
+        msgs = [(0, int(k * 1e9 / 30 + shift_s * 1e9)) for k in range(300)] + [(1, k * 10_000_000) for k in range(1000)]
+        with path.open("wb") as f:
+            w = Writer(f, chunk_size=4000)
+            w.start("test", "test")
+            sc = w.register_schema("sensor_msgs/msg/Image", "jsonschema", b"{}")
+            sj = w.register_schema("sensor_msgs/msg/JointState", "jsonschema", b"{}")
+            ids = [w.register_channel("/camera/image", "json", sc), w.register_channel("/joint_states", "json", sj)]
+            for ci, t in sorted(msgs, key=lambda m: m[1]):
+                w.add_message(ids[ci], log_time=t, publish_time=t, data=b"{}" * 30)
+            w.finish()
+        return path
+
+    req = parse_requirements({"streams": [
+        {"name": "camera", "match": {"topic": "/camera/*"}, "min_rate_hz": 25, "max_gap_ms": 50},
+        {"name": "joints", "match": {"topic": "/joint_states"}, "min_rate_hz": 50, "max_gap_ms": 20}],
+        "dataset": {"min_stream_overlap_pct": 95}}, "t")
+    out = {}
+    for label, shift in (("aligned", 0.0), ("shifted", 2.0)):
+        _, prof, _ = remote(rec(label, shift), msgidx_budget_bytes=3000)      # sampled, still exact spans
+        report = {"repo_id": "x", "files": [{"repo_path": f"{label}.mcap", "detected_format": "mcap", "valid": True,
+                                             "rich": _to_jsonable(prof), "summary": {}, "basic": {}}]}
+        v = evaluate(report, req)
+        out[label] = (stats(prof), {c.id: c.status for c in v.checks})
+    check(out["aligned"][0] == out["shifted"][0], f"per-stream numbers identical after a 2 s shift: {out['shifted'][0]}")
+    check(out["aligned"][1] == {"stream:camera": "pass", "stream:joints": "pass", "dataset:min_stream_overlap_pct": "pass"}
+          and out["shifted"][1] == {"stream:camera": "pass", "stream:joints": "pass", "dataset:min_stream_overlap_pct": "fail"},
+          f"only the overlap verdict flips: {out['shifted'][1]}")
 
 
 def mat_edge_cases() -> None:

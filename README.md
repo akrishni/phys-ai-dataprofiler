@@ -79,6 +79,11 @@ dataset:
 A number that was sampled and lies within 10% of the threshold, a NaN count the format cannot provide,
 or a file that failed to profile makes the result **unknown**, never a guessed pass.
 
+`dataset.min_stream_overlap_pct` checks that the required streams record together. It's computed per
+recording: per file for MCAP and bags, per episode for LeRobot (table against each camera's video). It
+catches a camera that stops halfway, or a video cut shorter than its episode, which each stream's own
+checks miss. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md#stream-overlap).
+
 ## ROS bag support
 
 `.bag` (ROS 1, format V2.0) and `.db3` (ROS 2, SQLite storage) files are profiled from byte ranges, like

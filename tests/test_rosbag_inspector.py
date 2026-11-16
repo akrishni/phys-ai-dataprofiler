@@ -90,6 +90,54 @@ def bag2(name: str, n: int = 4000, payload: int = 60, gap: bool = True, big_ever
     return next(d.glob("*.db3"))
 
 
+def ref_spans(path: Path) -> dict:
+    """First and last timestamp per topic from a full read through rosbags."""
+    reader = Reader1(path) if path.suffix == ".bag" else Reader2(path.parent)
+    out: dict[str, list[int]] = {}
+    with reader as r:
+        for conn, ts, _ in r.messages():
+            lo_hi = out.setdefault(conn.topic, [ts, ts])
+            lo_hi[0], lo_hi[1] = min(lo_hi[0], ts), max(lo_hi[1], ts)
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def spans(prof) -> dict:
+    return {c.topic: (c.start_ns, c.end_ns) for c in prof.channels}
+
+
+def span_cases() -> None:
+    """Each topic's first and last message time; exact when sampled (ROS 1), or marked inexact (ROS 2)."""
+    t0, ms = 1_700_000_000_000_000_000, 10_000_000
+    # /imu over 0-40 s; /camera/image only from 10 s to 30 s.
+    msgs = sorted([(0, t0 + k * ms) for k in range(4000)] + [(1, t0 + 10_000 * 1_000_000 + k * 5 * ms)
+                                                             for k in range(400)], key=lambda m: m[1])
+    p1 = TMP / "spans.bag"
+    w = Writer1(p1)
+    w.chunk_threshold = 2000
+    rng = np.random.default_rng(0)
+    with w:
+        conns = [w.add_connection(t, ty, typestore=TS1) for t, ty in TOPICS]
+        for i, t in msgs:
+            w.write(conns[i], t, rng.bytes(60))
+    want = ref_spans(p1)
+    _, prof, _ = run(inspect_bag1_remote, p1)
+    check(spans(prof) == want and all(c.time_exact for c in prof.channels), f"bag1: first/last per topic {spans(prof)}")
+    _, prof, _ = run(inspect_bag1_remote, p1, msgidx_budget_bytes=5_000)
+    check("sampled_message_index" in findings(prof) and spans(prof) == want
+          and all(c.time_exact for c in prof.channels),
+          "bag1 sampled: each topic's first and last chunk still read, spans exact")
+
+    p2 = tiny_bag(2, "spans2", msgs)
+    want = ref_spans(p2)
+    _, prof, _ = run(inspect_bag2_remote, p2)
+    check(spans(prof) == want and all(c.time_exact for c in prof.channels), "bag2: first/last per topic, exact")
+    _, prof, _ = run(inspect_bag2_remote, p2, msgidx_budget_bytes=20_000)
+    ex = {c.topic: c.time_exact for c in prof.channels}
+    check("sampled_message_index" in findings(prof) and ex == {"/imu": True, "/camera/image": False}
+          and spans(prof)["/imu"] == want["/imu"],
+          f"bag2 sampled: /imu (in the first and last rows) exact, /camera/image (only mid-file) inexact: {ex}")
+
+
 def reference(path: Path) -> dict:
     """Full-read statistics through rosbags and the shared timing code."""
     reader = Reader1(path) if path.suffix == ".bag" else Reader2(path.parent)
@@ -235,6 +283,7 @@ def main() -> None:
     check(sniff_format(LocalRangeFile(other), "data.db3") == "unknown", "bag2: unrelated SQLite not sniffed as bag")
 
     edge_cases()
+    span_cases()
 
     if "--hub" in sys.argv:
         hub()

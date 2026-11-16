@@ -419,7 +419,8 @@ def _timing(ts_ns: np.ndarray, ep: np.ndarray | None) -> dict:
         _, first, counts = np.unique(seg_id, return_index=True, return_counts=True)
         last = first + counts - 1
         dur = (ts[last] - ts[first]) / 1e9
-        out.update(frames=counts, seconds=dur)
+        out.update(frames=counts, seconds=dur, first_ns=ts[first], last_ns=ts[last],
+                   segment_ids=eps[first] if ep is not None else np.arange(len(first)))
     return out
 
 
@@ -548,6 +549,11 @@ def inspect_parquet(
                 "seconds_min": round(float(secs.min()), 3), "seconds_median": round(float(np.median(secs)), 3),
                 "seconds_max": round(float(secs.max()), 3),
                 "complete": not sampled,
+                # Per episode: [episode id, first timestamp s, last timestamp s, frames]. Exact when
+                # "complete"; with sampled row groups an episode may continue in rows not read.
+                "spans": [[int(e), round(float(a) / 1e9, 6), round(float(b) / 1e9, 6), int(f)]
+                          for e, a, b, f in zip(timing["segment_ids"], timing["first_ns"], timing["last_ns"],
+                                                frames, strict=True)] if ep_col else None,
             }
             if not sampled and len(frames) >= 3:
                 med = float(np.median(secs))

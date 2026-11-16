@@ -61,11 +61,12 @@ STREAM_THRESHOLDS = ("min_rate_hz", "max_rate_hz", "max_jitter_ms", "max_gap_ms"
 STREAM_KEYS = ("name", "required", "match", "min_count", "coverage") + STREAM_THRESHOLDS
 MATCH_KEYS = ("topic", "exclude_topic", "modality", "schema")
 DATASET_KEYS = ("min_total_hours", "min_episodes", "min_episode_seconds", "max_short_episodes_pct",
-                "same_schema_across_files", "max_invalid_files_pct", "max_unindexed_files_pct")
+                "same_schema_across_files", "max_invalid_files_pct", "max_unindexed_files_pct",
+                "min_stream_overlap_pct")
 TOP_KEYS = ("version", "name", "description", "files", "streams", "dataset")
 FILES_KEYS = ("include", "exclude")
 INT_FIELDS = {"max_gaps", "max_nan", "min_episodes"}
-PCT_FIELDS = {"max_short_episodes_pct", "max_invalid_files_pct", "max_unindexed_files_pct"}
+PCT_FIELDS = {"max_short_episodes_pct", "max_invalid_files_pct", "max_unindexed_files_pct", "min_stream_overlap_pct"}
 
 
 class RequirementsError(ValueError):
@@ -147,6 +148,8 @@ class DatasetRequirements:
     same_schema_across_files: bool | None = None
     max_invalid_files_pct: float | None = None
     max_unindexed_files_pct: float | None = None
+    # Per recording: time when every required stream has data / time when any has, in percent.
+    min_stream_overlap_pct: float | None = None
 
     def active(self) -> list[str]:
         out = []
@@ -362,6 +365,10 @@ def parse_requirements(doc: Any, source: str = "") -> Requirements:
                         setattr(d, k, val if val is not None else getattr(d, k))
             if "max_short_episodes_pct" in ds and "min_episode_seconds" not in ds:
                 v.err("dataset.max_short_episodes_pct", "only means something together with min_episode_seconds")
+            if d.min_stream_overlap_pct is not None and sum(sr.required for sr in req.streams) < 2:
+                v.err("dataset.min_stream_overlap_pct",
+                      "compares the time ranges of the required streams, so needs at least two required "
+                      f"streams under streams (found {sum(sr.required for sr in req.streams)})")
 
     if not req.streams and not req.dataset.active() and not v.errors:
         v.err("", "no requirements: add at least one entry under streams or dataset")
