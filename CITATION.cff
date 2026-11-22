@@ -6,8 +6,8 @@ authors:
   - family-names: Krishniyer
     given-names: Anand
     email: akrishniyer@gmail.com
-version: 0.5.0
-date-released: 2026-11-03
+version: 0.6.0
+date-released: 2026-11-22
 license: MIT
 repository-code: "https://github.com/akrishni/phys-ai-dataprofiler"
 url: "https://pypi.org/project/phys-ai-dataprofiler/"
