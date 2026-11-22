@@ -168,6 +168,22 @@ Frame timestamps are the container's timeline as the encoder wrote it. Most reco
 encode at a fixed rate, so a frame dropped at capture time shows as a gap only if the writer kept real
 capture timestamps; the Parquet `timestamp` column is the better check for capture gaps.
 
+## Local files
+
+The same command also works on a local directory or file, with no network and no token:
+
+```bash
+phys-ai-dataprofiler ./my-dataset --ext .mcap .mat          # a directory
+phys-ai-dataprofiler ./my-dataset/run_042.mcap                # a single file
+phys-ai-dataprofiler check ./my-dataset -r preset:teleop-imitation
+```
+
+If the argument names an existing path on disk, it's treated as local instead of a Hub repo id; a
+directory is walked recursively, skipping dot-files. Local files are read the same way as remote ones,
+through byte-range reads (`LocalRangeFile`), so a large `.mcap` or `.mat` file is still profiled from its
+header and index rather than read in full. `--mode`, `--download-dir` and `--keep-downloads` have no
+effect on a local target.
+
 ## Usage
 
 ```bash
@@ -237,7 +253,9 @@ checks need network access and are only run on demand: Actions tab, "tests", "Ru
 
 ```
 phys_ai_dataprofiler/
-  connectors/huggingface.py   Hub connector and the default CLI command
+  connectors/huggingface.py   Hub connector, local-filesystem dispatch, and the default CLI command
+  connectors/localfs.py       local directory/file connector
+  connectors/base.py          pieces shared by every connector (file selection, LeRobot video info)
   cli.py                      check, compare, requirements subcommands
   requirements.py evaluate.py compare.py   requirements files, verdicts, comparisons
   presets/                    built-in requirements files

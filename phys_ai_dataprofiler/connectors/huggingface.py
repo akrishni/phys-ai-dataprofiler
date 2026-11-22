@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Hugging Face Hub connector for the MCAP / MATLAB file inspectors.
+Hugging Face Hub and local filesystem connectors for the MCAP / MATLAB file inspectors.
 
-Connects to the Hub with an access token, lists the files in a repo
-(dataset by default), runs the inspectors on the MCAP / MAT files, and writes
-a JSON + Markdown report.
+The positional argument is either a Hugging Face repo id (org/dataset) or a path to a local
+directory or file. For a Hub repo id, connects to the Hub with an access token and lists the files
+in a repo (dataset by default); for a local path, walks it directly. Either way, runs the inspectors
+on the matching files and writes a JSON + Markdown report.
 
-Two modes:
+Two modes (Hub repos only; a local path always uses byte-range reads, like "remote"):
 
   remote   (default) Nothing is downloaded. Files are read through HTTP Range
            requests and only the bytes that hold metadata are fetched: the
@@ -21,7 +22,7 @@ Two modes:
   download Files are downloaded to --download-dir and inspected locally with
            the full-read inspectors (previous behaviour).
 
-Token resolution order:
+Token resolution order (Hub repos only):
   1. --token on the command line
   2. HF_TOKEN / HUGGINGFACE_HUB_TOKEN environment variables
   3. the token cached by `hf auth login` (huggingface_hub default)
@@ -34,12 +35,12 @@ Typical use:
     phys-ai-dataprofiler org/dataset --full-read-max-mb 50     # small files read whole
     phys-ai-dataprofiler org/dataset --mode download --max-total-mb 2000
     phys-ai-dataprofiler org/dataset --mode download --offline  # reuse earlier downloads
+    phys-ai-dataprofiler ./local/dataset-dir --ext .mcap .mat   # local directory, no network
 """
 
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 import os
 import sys
@@ -51,6 +52,8 @@ from typing import Any, Iterable
 
 
 from phys_ai_dataprofiler import __version__
+from phys_ai_dataprofiler.connectors.base import RemoteFile, load_video_info, select_files
+from phys_ai_dataprofiler.connectors.localfs import LocalFsConnector
 from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector, MCAP_MAGIC
 from phys_ai_dataprofiler.inspectors.mat import MatFileInspector, HDF5_MAGIC, MATFILE_V5_MAGIC
 from phys_ai_dataprofiler.inspectors.rich import RichInspector
@@ -59,7 +62,7 @@ from phys_ai_dataprofiler.remote.inspector import inspect_mcap_remote, inspect_m
 from phys_ai_dataprofiler.remote.parquet import inspect_parquet
 from phys_ai_dataprofiler.remote.rosbag import inspect_bag1_remote, inspect_bag2_remote
 from phys_ai_dataprofiler.remote.lerobot_meta import episode_tables, read_spans
-from phys_ai_dataprofiler.remote.mp4 import declared_videos, inspect_mp4, recording_seconds, video_stream_name
+from phys_ai_dataprofiler.remote.mp4 import inspect_mp4, recording_seconds, video_stream_name
 from phys_ai_dataprofiler.remote.range_file import LocalRangeFile
 
 try:
@@ -83,13 +86,6 @@ TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 # --------------------------------------------------------------------------- #
 # Data model
 # --------------------------------------------------------------------------- #
-
-@dataclass
-class RemoteFile:
-    path: str                     # path inside the repo
-    size: int | None              # bytes, if the Hub reported it
-    sha: str | None = None        # blob id / lfs sha
-
 
 @dataclass
 class FileReport:
@@ -217,32 +213,6 @@ def resolve_token(explicit: str | None) -> str | None:
     return None
 
 
-def _interleave_kinds(files: list[RemoteFile]) -> list[RemoteFile]:
-    """Order files so a --max-files sample takes from every kind of file in the repo.
-
-    A LeRobot repo sorts `data/*.parquet` before `videos/<camera>/*.mp4`, so the first N paths would be
-    tables only and every camera would go unprofiled. Kinds are the top-level folder plus, under
-    `videos/`, the camera; each kind keeps its own path order and kinds take turns.
-    """
-    from phys_ai_dataprofiler.remote.mp4 import video_stream_name
-    kinds: dict[str, list[RemoteFile]] = {}
-    for f in files:
-        top = f.path.split("/", 1)[0] if "/" in f.path else ""
-        kind = top + ("/" + video_stream_name(f.path)[0] if f.path.lower().endswith(".mp4") else "")
-        kinds.setdefault(kind, []).append(f)
-    out: list[RemoteFile] = []
-    queues = list(kinds.values())
-    i = 0
-    while queues:
-        q = queues[i % len(queues)]
-        out.append(q.pop(0))
-        if not q:
-            queues.remove(q)
-        else:
-            i += 1
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # Connector
 # --------------------------------------------------------------------------- #
@@ -352,51 +322,10 @@ class HuggingFaceConnector:
         max_total_bytes: int | None = None,
     ) -> tuple[list[RemoteFile], list[dict]]:
         """Pick which files to inspect. Returns (selected, skipped_with_reason)."""
-        exts = tuple(e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions)
-        explicit_set = set(explicit or [])
-        include = list(include or [])
-        exclude = list(exclude or [])
-
-        selected: list[RemoteFile] = []
-        skipped: list[dict] = []
-        total = 0
-
-        ordered = sorted(files, key=lambda x: x.path)
-        if max_files is not None and not explicit_set:
-            ordered = _interleave_kinds(ordered)
-        for f in ordered:
-            if explicit_set:
-                if f.path not in explicit_set:
-                    continue
-            else:
-                if not f.path.lower().endswith(exts):
-                    continue
-                if include and not any(fnmatch.fnmatch(f.path, p) for p in include):
-                    skipped.append({"path": f.path, "size": f.size, "reason": "not matched by --include"})
-                    continue
-                if exclude and any(fnmatch.fnmatch(f.path, p) for p in exclude):
-                    skipped.append({"path": f.path, "size": f.size, "reason": "matched --exclude"})
-                    continue
-
-            if max_file_bytes is not None and f.size is not None and f.size > max_file_bytes:
-                skipped.append({"path": f.path, "size": f.size, "reason": "exceeds --max-file-mb"})
-                continue
-            if max_total_bytes is not None and f.size is not None and total + f.size > max_total_bytes:
-                skipped.append({"path": f.path, "size": f.size, "reason": "would exceed --max-total-mb"})
-                continue
-            if max_files is not None and len(selected) >= max_files:
-                skipped.append({"path": f.path, "size": f.size, "reason": "exceeds --max-files"})
-                continue
-
-            selected.append(f)
-            total += f.size or 0
-
-        missing = explicit_set - {f.path for f in selected} - {s["path"] for s in skipped}
-        for path in sorted(missing):
-            skipped.append({"path": path, "size": None, "reason": "not found in repo"})
-
-        selected.sort(key=lambda x: x.path)
-        return selected, skipped
+        return select_files(
+            files, extensions, include=include, exclude=exclude, explicit=explicit,
+            max_files=max_files, max_file_bytes=max_file_bytes, max_total_bytes=max_total_bytes,
+        )
 
     # -- access -------------------------------------------------------------
 
@@ -420,13 +349,7 @@ class HuggingFaceConnector:
 
     def load_video_info(self, files: Iterable[RemoteFile]) -> dict[str, dict]:
         """Read LeRobot's meta/info.json, if the repo has one, for what each camera should look like."""
-        if not any(f.path == "meta/info.json" for f in files):
-            return {}
-        try:
-            self.video_info = declared_videos(json.loads(self.read_text("meta/info.json")))
-        except Exception as exc:
-            self.log(f"Could not read meta/info.json: {exc}")
-        return self.video_info
+        return load_video_info(self, files)
 
     def download(self, remote: RemoteFile, local_dir: Path, force: bool = False) -> Path:
         """Download one file into local_dir, preserving its repo path."""
@@ -574,8 +497,8 @@ def _sidecar_path(repo_path: str) -> str:
     return repo_path.rsplit("/", 1)[0] + "/metadata.yaml" if "/" in repo_path else "metadata.yaml"
 
 
-def inspect_remote_file(connector: HuggingFaceConnector, remote: RemoteFile, args, log) -> FileReport:
-    """Metadata-only inspection over HTTP Range requests (remote mode)."""
+def inspect_remote_file(connector: "HuggingFaceConnector | LocalFsConnector", remote: RemoteFile, args, log) -> FileReport:
+    """Metadata-only inspection over byte-range reads (remote or local mode)."""
     t0 = time.time()
     report = FileReport(repo_path=remote.path, local_path=None, size_bytes=remote.size,
                         detected_format=None, valid=False, mode="remote")
@@ -650,7 +573,7 @@ def build_totals(files: list[FileReport]) -> dict:
         "fetched_pct": round(fetched / size * 100, 3) if size else None,
         "requests": sum(f.requests or 0 for f in files),
         "by_format": by_format,
-        "by_mode": {m: sum(1 for f in files if f.mode == m) for m in ("remote", "download") if any(f.mode == m for f in files)},
+        "by_mode": {m: sum(1 for f in files if f.mode == m) for m in ("remote", "download", "local") if any(f.mode == m for f in files)},
         "messages": sum(f.summary.get("messages", 0) or 0 for f in files),
         # Cameras of one recording, and a LeRobot table and its videos, cover the same time: counted once.
         "duration_s": round(recording_seconds(
@@ -664,12 +587,14 @@ def build_totals(files: list[FileReport]) -> dict:
 
 def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
     L: list[str] = []
-    L.append(f"# Inspection report: `{run.repo_type}/{run.repo_id}`")
+    L.append(f"# Inspection report: `{run.repo_id if run.repo_type == 'local' else f'{run.repo_type}/{run.repo_id}'}`")
     L.append("")
     L.append(f"- Generated: {run.generated_at}")
-    L.append(f"- Revision: `{run.revision or 'main'}` (sha `{run.resolved_sha or '-'}`)")
-    L.append(f"- Authenticated as: {run.authenticated_as or 'anonymous'}")
-    L.append(f"- Mode: {run.mode}" + (" (HTTP byte-range reads, nothing downloaded)" if run.mode == "remote" else ""))
+    if run.repo_type != "local":
+        L.append(f"- Revision: `{run.revision or 'main'}` (sha `{run.resolved_sha or '-'}`)")
+        L.append(f"- Authenticated as: {run.authenticated_as or 'anonymous'}")
+    L.append(f"- Mode: {run.mode}" + (" (HTTP byte-range reads, nothing downloaded)" if run.mode == "remote"
+             else " (byte-range reads from disk)" if run.mode == "local" else ""))
     if run.download_dir:
         L.append(f"- Download dir: `{run.download_dir}`")
     L.append(f"- Files in repo: {run.files_listed}; selected: {run.files_selected}; "
@@ -880,9 +805,10 @@ def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
 
 
 def print_console_summary(run: RunReport, log) -> None:
+    target = run.repo_id if run.repo_type == "local" else f"{run.repo_type}/{run.repo_id}"
     log("")
     log("=" * 110)
-    log(f"HUGGING FACE INSPECTION SUMMARY  {run.repo_type}/{run.repo_id}  [{run.mode}]")
+    log(f"INSPECTION SUMMARY  {target}  [{run.mode}]")
     log("=" * 110)
     t = run.totals
     log(f"Files inspected: {t['files']}   valid: {t['valid']}   errored: {t['invalid_or_errored']}   "
@@ -912,16 +838,48 @@ class NothingToProfile(RuntimeError):
     """The repo has no files this tool can profile."""
 
 
+def _select_and_prepare(connector, remote_files: list[RemoteFile], args, log, label: str) -> tuple[list[RemoteFile], list[dict]]:
+    """Select files from a listed source, log the choice, load LeRobot video info, and raise
+    NothingToProfile if nothing matched. Shared by the Hub and local-filesystem branches of `run()`."""
+    selected, skipped = select_files(
+        remote_files,
+        extensions=args.ext,
+        include=args.include,
+        exclude=args.exclude,
+        explicit=args.file,
+        max_files=args.max_files,
+        max_file_bytes=int(args.max_file_mb * 1024 * 1024) if args.max_file_mb else None,
+        max_total_bytes=int(args.max_total_mb * 1024 * 1024) if args.max_total_mb else None,
+    )
+    log(f"Selected {len(selected)} file(s), "
+        f"{_human_size(sum(f.size or 0 for f in selected))}; skipped {len(skipped)}; mode={args.mode}")
+    if not selected and not args.file:
+        from collections import Counter
+        exts = Counter((Path(f.path).suffix.lower() or "(no extension)") for f in remote_files)
+        found = ", ".join(f"{n} {e}" for e, n in exts.most_common(8))
+        wanted = " ".join(args.ext)
+        if not skipped:
+            raise NothingToProfile(
+                f"No {wanted} files in {label}. It contains: {found}. "
+                f"Use --ext to choose other extensions, or --file for a specific path.")
+    for f in selected:
+        log(f"  + {f.path}  ({_human_size(f.size)})")
+    if any(sniff_ext(f.path) == "mp4" for f in selected) and not args.dry_run:
+        if connector.load_video_info(remote_files):
+            log(f"meta/info.json describes {len(connector.video_info)} camera(s); videos are checked against it")
+    return selected, skipped
+
+
 def run(args: argparse.Namespace) -> RunReport:
     log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, file=sys.stderr))
     t_start = time.time()
 
     download_dir = Path(args.download_dir).resolve()
-    repo_slug = args.repo_id.replace("/", "__")
+    repo_slug = args.repo_id.lstrip("/").replace("/", "__")
     local_root = download_dir / f"{args.repo_type}__{repo_slug}"
     full_read_bytes = int(args.full_read_max_mb * 1024 * 1024) if args.full_read_max_mb else 0
 
-    connector: HuggingFaceConnector | None = None
+    connector: HuggingFaceConnector | LocalFsConnector | None = None
     user = None
     resolved_sha = None
     skipped: list[dict] = []
@@ -930,6 +888,10 @@ def run(args: argparse.Namespace) -> RunReport:
     remote_files: list[RemoteFile] = []
     selected: list[RemoteFile] = []
     downloaded = 0
+    local_target = Path(args.repo_id)
+
+    # What the RunReport records as the target; overridden below for a local target.
+    report_repo_id, report_repo_type, report_revision = args.repo_id, args.repo_type, args.revision
 
     if args.offline:
         if not local_root.exists():
@@ -943,6 +905,30 @@ def run(args: argparse.Namespace) -> RunReport:
             selected.append(RemoteFile(path=p.relative_to(local_root).as_posix(), size=p.stat().st_size))
         log(f"Offline mode: inspecting {len(selected)} file(s) under {local_root}")
         mode = "download"
+    elif local_target.exists():
+        mode = "local"
+        report_repo_id, report_repo_type, report_revision = str(local_target), "local", None
+        connector = LocalFsConnector(local_target, log=log)
+        connector.connect()
+
+        remote_files = connector.list_files()
+        files_listed = len(remote_files)
+        log(f"{local_target} contains {files_listed} file(s), "
+            f"{_human_size(sum(f.size or 0 for f in remote_files))} total")
+
+        selected, skipped = _select_and_prepare(connector, remote_files, args, log, label=str(local_target))
+
+        if args.dry_run:
+            log("Dry run: not inspecting.")
+            return RunReport(
+                repo_id=report_repo_id, repo_type=report_repo_type, revision=report_revision,
+                resolved_sha=None, authenticated_as=None,
+                generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                mode=mode, download_dir=None, files_listed=files_listed,
+                files_selected=len(selected), files_downloaded=0, files_skipped=skipped,
+                total_bytes_selected=sum(f.size or 0 for f in selected),
+                files=[], totals=build_totals([]), run_cost_s=round(time.time() - t_start, 2),
+            )
     else:
         mode = args.mode
         connector = HuggingFaceConnector(
@@ -957,37 +943,13 @@ def run(args: argparse.Namespace) -> RunReport:
         log(f"Repo contains {files_listed} file(s), "
             f"{_human_size(sum(f.size or 0 for f in remote_files))} total")
 
-        selected, skipped = HuggingFaceConnector.select_files(
-            remote_files,
-            extensions=args.ext,
-            include=args.include,
-            exclude=args.exclude,
-            explicit=args.file,
-            max_files=args.max_files,
-            max_file_bytes=int(args.max_file_mb * 1024 * 1024) if args.max_file_mb else None,
-            max_total_bytes=int(args.max_total_mb * 1024 * 1024) if args.max_total_mb else None,
-        )
-        log(f"Selected {len(selected)} file(s), "
-            f"{_human_size(sum(f.size or 0 for f in selected))}; skipped {len(skipped)}; mode={mode}")
-        if not selected and not args.file:
-            from collections import Counter
-            exts = Counter((Path(f.path).suffix.lower() or "(no extension)") for f in remote_files)
-            found = ", ".join(f"{n} {e}" for e, n in exts.most_common(8))
-            wanted = " ".join(args.ext)
-            if not skipped:
-                raise NothingToProfile(
-                    f"No {wanted} files in {args.repo_type}/{args.repo_id}. It contains: {found}. "
-                    f"Use --ext to choose other extensions, or --file for a specific path.")
-        for f in selected:
-            log(f"  + {f.path}  ({_human_size(f.size)})")
-        if any(sniff_ext(f.path) == "mp4" for f in selected) and not args.dry_run:
-            if connector.load_video_info(remote_files):
-                log(f"meta/info.json describes {len(connector.video_info)} camera(s); videos are checked against it")
+        selected, skipped = _select_and_prepare(
+            connector, remote_files, args, log, label=f"{args.repo_type}/{args.repo_id}")
 
         if args.dry_run:
             log("Dry run: not inspecting.")
             return RunReport(
-                repo_id=args.repo_id, repo_type=args.repo_type, revision=args.revision,
+                repo_id=report_repo_id, repo_type=report_repo_type, revision=report_revision,
                 resolved_sha=resolved_sha, authenticated_as=user,
                 generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 mode=mode, download_dir=None, files_listed=files_listed,
@@ -1047,7 +1009,9 @@ def run(args: argparse.Namespace) -> RunReport:
         log(f"    {rep.detected_format} {status} ({rep.inspect_s}s)")
 
         # In remote mode the full-read fallback is temporary unless asked to keep it.
-        cleanup = args.delete_after or (mode == "remote" and not args.keep_downloads and connector is not None)
+        # --delete-after is for copies made by "download" mode; a local target's files are never copies.
+        cleanup = (args.delete_after and mode != "local") or (
+            mode == "remote" and not args.keep_downloads and connector is not None)
         if cleanup and Path(local_path).exists():
             try:
                 Path(local_path).unlink()
@@ -1060,9 +1024,9 @@ def run(args: argparse.Namespace) -> RunReport:
         lerobot_episodes = _episode_spans(connector, remote_files, local_root, args, log)
 
     return RunReport(
-        repo_id=args.repo_id,
-        repo_type=args.repo_type,
-        revision=args.revision,
+        repo_id=report_repo_id,
+        repo_type=report_repo_type,
+        revision=report_revision,
         resolved_sha=resolved_sha,
         authenticated_as=user,
         generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1104,7 +1068,7 @@ def write_reports(run_report: RunReport, report_dir: Path, basename: str | None,
                   verdict_md: str | None = None) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = basename or f"{run_report.repo_type}__{run_report.repo_id.replace('/', '__')}__{stamp}"
+    base = basename or f"{run_report.repo_type}__{run_report.repo_id.lstrip('/').replace('/', '__')}__{stamp}"
     json_path = report_dir / f"{base}.json"
     md_path = report_dir / f"{base}.md"
     json_path.write_text(json.dumps(_to_jsonable(run_report), indent=2))
@@ -1117,13 +1081,14 @@ def write_reports(run_report: RunReport, report_dir: Path, basename: str | None,
 def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
-        description="Profile MCAP, ROS bag, MAT and Parquet files in a Hugging Face repo and write a report. "
+        description="Profile MCAP, ROS bag, MAT and Parquet files in a Hugging Face repo or a local "
+                    "directory/file and write a report. "
                     "Other commands: check, compare, requirements (run '<command> -h').",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument("--version", action="version", version=f"phys-ai-dataprofiler {__version__}")
-    p.add_argument("repo_id", help="Hub repo id, e.g. org/dataset-name")
+    p.add_argument("repo_id", help="Hub repo id (org/dataset-name), or a local directory or file path")
     p.add_argument("--token", help="Hugging Face access token (else HF_TOKEN env or cached login)")
     p.add_argument("--repo-type", default="dataset", choices=["dataset", "model", "space"])
     p.add_argument("--revision", help="Branch, tag or commit sha (default: main)")
