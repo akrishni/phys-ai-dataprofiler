@@ -184,6 +184,24 @@ through byte-range reads (`LocalRangeFile`), so a large `.mcap` or `.mat` file i
 header and index rather than read in full. `--mode`, `--download-dir` and `--keep-downloads` have no
 effect on a local target.
 
+## S3
+
+```bash
+pip install "phys-ai-dataprofiler[s3]"
+
+phys-ai-dataprofiler s3://my-bucket/episodes/ --ext .mcap .mat
+phys-ai-dataprofiler s3://my-bucket/episodes/ --aws-profile prod --aws-region us-west-2
+phys-ai-dataprofiler s3://my-bucket/episodes/ --endpoint-url https://minio.internal:9000
+phys-ai-dataprofiler check s3://my-bucket/episodes/ -r preset:teleop-imitation
+```
+
+An `s3://bucket/prefix` target is read through `GetObject` calls with a `Range` header, the same
+"only fetch headers and indexes" approach as the Hub connector, so large objects aren't downloaded in
+full. `--mode download` and `--full-read-max-mb` work as they do for a Hub repo. Credentials resolve
+through boto3's normal chain (environment variables, `~/.aws/credentials`, an instance or task role)
+unless `--aws-profile` names a profile; `--endpoint-url` points at an S3-compatible store (MinIO,
+Cloudflare R2, on-prem) instead of AWS.
+
 ## Usage
 
 ```bash
@@ -253,8 +271,9 @@ checks need network access and are only run on demand: Actions tab, "tests", "Ru
 
 ```
 phys_ai_dataprofiler/
-  connectors/huggingface.py   Hub connector, local-filesystem dispatch, and the default CLI command
+  connectors/huggingface.py   Hub connector, target dispatch (Hub/S3/local), and the default CLI command
   connectors/localfs.py       local directory/file connector
+  connectors/s3.py            S3 bucket/prefix connector
   connectors/base.py          pieces shared by every connector (file selection, LeRobot video info)
   cli.py                      check, compare, requirements subcommands
   requirements.py evaluate.py compare.py   requirements files, verdicts, comparisons

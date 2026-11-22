@@ -7,6 +7,9 @@ resolved (CDN) URL. A small block cache absorbs the many tiny reads that
 parsers such as the mcap StreamReader issue, and `fetch_many()` pulls a list of
 scattered ranges in parallel for things like MCAP message indexes.
 
+`S3RangeFile` does the same over an S3 object: every read becomes a `GetObject`
+call with a `Range` header.
+
 `LocalRangeFile` offers the same interface over a local file so the remote
 inspectors can be tested and used offline.
 """
@@ -28,6 +31,12 @@ try:
     HF_AVAILABLE = True
 except ImportError:  # pragma: no cover
     HF_AVAILABLE = False
+
+try:
+    import botocore.exceptions
+    S3_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    S3_AVAILABLE = False
 
 
 DEFAULT_BLOCK_SIZE = 64 * 1024
@@ -324,3 +333,33 @@ class HfRangeFile(RangeFile):
                 last_exc = exc
                 time.sleep(0.5 * (2 ** attempt))
         raise RuntimeError(f"range fetch failed after {self.retries + 1} attempts: {last_exc}")
+
+
+class S3RangeFile(RangeFile):
+    """An S3 object read through `GetObject` calls with a `Range` header.
+
+    boto3's own retry logic (the client's default `standard` retry mode) handles transient errors,
+    so unlike `HfRangeFile` there is no hand-rolled retry loop here.
+    """
+
+    def __init__(self, client, bucket: str, key: str, **kwargs) -> None:
+        if not S3_AVAILABLE:
+            raise RuntimeError("boto3 is not installed. Run: pip install boto3")
+        super().__init__(**kwargs)
+        self.client = client
+        self.bucket = bucket
+        self.key = key
+        head = self.client.head_object(Bucket=bucket, Key=key)
+        self.size = int(head["ContentLength"])
+
+    @property
+    def url(self) -> str:
+        return f"s3://{self.bucket}/{self.key}"
+
+    def _fetch(self, start: int, end: int) -> bytes:
+        try:
+            resp = self.client.get_object(Bucket=self.bucket, Key=self.key, Range=f"bytes={start}-{end - 1}")
+            return resp["Body"].read()
+        except botocore.exceptions.ClientError as exc:
+            raise RuntimeError(f"S3 fetch failed for s3://{self.bucket}/{self.key} "
+                               f"bytes {start}-{end - 1}: {exc}") from exc

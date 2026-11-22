@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Hugging Face Hub and local filesystem connectors for the MCAP / MATLAB file inspectors.
+Hugging Face Hub, S3, and local filesystem connectors for the MCAP / MATLAB file inspectors.
 
-The positional argument is either a Hugging Face repo id (org/dataset) or a path to a local
-directory or file. For a Hub repo id, connects to the Hub with an access token and lists the files
-in a repo (dataset by default); for a local path, walks it directly. Either way, runs the inspectors
-on the matching files and writes a JSON + Markdown report.
+The positional argument is a Hugging Face repo id (org/dataset), an `s3://bucket/prefix` URI, or a
+path to a local directory or file. For a Hub repo id, connects to the Hub with an access token and
+lists the files in a repo (dataset by default); for S3, lists objects under the bucket/prefix; for a
+local path, walks it directly. Either way, runs the inspectors on the matching files and writes a
+JSON + Markdown report.
 
-Two modes (Hub repos only; a local path always uses byte-range reads, like "remote"):
+Two modes (Hub repos and S3 only; a local path always uses byte-range reads, like "remote"):
 
   remote   (default) Nothing is downloaded. Files are read through HTTP Range
-           requests and only the bytes that hold metadata are fetched: the
-           MCAP header, footer, summary and message indexes; the MAT header
+           requests (S3: `GetObject` with a `Range` header) and only the bytes that hold metadata
+           are fetched: the MCAP header, footer, summary and message indexes; the MAT header
            and per-variable headers; the Parquet footer; the MP4 index (moov box).
            Well under 1% of a large file; small files and float data scanned
            for NaNs (--nan-budget-mb) cost more.
@@ -27,6 +28,9 @@ Token resolution order (Hub repos only):
   2. HF_TOKEN / HUGGINGFACE_HUB_TOKEN environment variables
   3. the token cached by `hf auth login` (huggingface_hub default)
 
+AWS credentials (S3 only) resolve through boto3's normal chain (env vars, ~/.aws/credentials, an
+instance/task role), or --aws-profile for a named profile.
+
 Typical use:
 
     phys-ai-dataprofiler org/dataset --token hf_xxx
@@ -36,6 +40,7 @@ Typical use:
     phys-ai-dataprofiler org/dataset --mode download --max-total-mb 2000
     phys-ai-dataprofiler org/dataset --mode download --offline  # reuse earlier downloads
     phys-ai-dataprofiler ./local/dataset-dir --ext .mcap .mat   # local directory, no network
+    phys-ai-dataprofiler s3://my-bucket/episodes/ --aws-profile prod  # S3 bucket/prefix
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from typing import Any, Iterable
 from phys_ai_dataprofiler import __version__
 from phys_ai_dataprofiler.connectors.base import RemoteFile, load_video_info, select_files
 from phys_ai_dataprofiler.connectors.localfs import LocalFsConnector
+from phys_ai_dataprofiler.connectors.s3 import S3Connector, parse_s3_uri
 from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector, MCAP_MAGIC
 from phys_ai_dataprofiler.inspectors.mat import MatFileInspector, HDF5_MAGIC, MATFILE_V5_MAGIC
 from phys_ai_dataprofiler.inspectors.rich import RichInspector
@@ -497,7 +503,7 @@ def _sidecar_path(repo_path: str) -> str:
     return repo_path.rsplit("/", 1)[0] + "/metadata.yaml" if "/" in repo_path else "metadata.yaml"
 
 
-def inspect_remote_file(connector: "HuggingFaceConnector | LocalFsConnector", remote: RemoteFile, args, log) -> FileReport:
+def inspect_remote_file(connector: "HuggingFaceConnector | LocalFsConnector | S3Connector", remote: RemoteFile, args, log) -> FileReport:
     """Metadata-only inspection over byte-range reads (remote or local mode)."""
     t0 = time.time()
     report = FileReport(repo_path=remote.path, local_path=None, size_bytes=remote.size,
@@ -587,13 +593,15 @@ def build_totals(files: list[FileReport]) -> dict:
 
 def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
     L: list[str] = []
-    L.append(f"# Inspection report: `{run.repo_id if run.repo_type == 'local' else f'{run.repo_type}/{run.repo_id}'}`")
+    no_prefix = run.repo_type in ("local", "s3")
+    L.append(f"# Inspection report: `{run.repo_id if no_prefix else f'{run.repo_type}/{run.repo_id}'}`")
     L.append("")
     L.append(f"- Generated: {run.generated_at}")
-    if run.repo_type != "local":
+    if run.repo_type != "local" and run.repo_type != "s3":
         L.append(f"- Revision: `{run.revision or 'main'}` (sha `{run.resolved_sha or '-'}`)")
+    if run.repo_type != "local":
         L.append(f"- Authenticated as: {run.authenticated_as or 'anonymous'}")
-    L.append(f"- Mode: {run.mode}" + (" (HTTP byte-range reads, nothing downloaded)" if run.mode == "remote"
+    L.append(f"- Mode: {run.mode}" + (" (byte-range reads, nothing downloaded)" if run.mode == "remote"
              else " (byte-range reads from disk)" if run.mode == "local" else ""))
     if run.download_dir:
         L.append(f"- Download dir: `{run.download_dir}`")
@@ -805,7 +813,7 @@ def render_markdown(run: RunReport, verdict_md: str | None = None) -> str:
 
 
 def print_console_summary(run: RunReport, log) -> None:
-    target = run.repo_id if run.repo_type == "local" else f"{run.repo_type}/{run.repo_id}"
+    target = run.repo_id if run.repo_type in ("local", "s3") else f"{run.repo_type}/{run.repo_id}"
     log("")
     log("=" * 110)
     log(f"INSPECTION SUMMARY  {target}  [{run.mode}]")
@@ -875,11 +883,10 @@ def run(args: argparse.Namespace) -> RunReport:
     t_start = time.time()
 
     download_dir = Path(args.download_dir).resolve()
-    repo_slug = args.repo_id.lstrip("/").replace("/", "__")
-    local_root = download_dir / f"{args.repo_type}__{repo_slug}"
     full_read_bytes = int(args.full_read_max_mb * 1024 * 1024) if args.full_read_max_mb else 0
+    is_s3 = args.repo_id.startswith("s3://")
 
-    connector: HuggingFaceConnector | LocalFsConnector | None = None
+    connector: HuggingFaceConnector | LocalFsConnector | S3Connector | None = None
     user = None
     resolved_sha = None
     skipped: list[dict] = []
@@ -888,10 +895,13 @@ def run(args: argparse.Namespace) -> RunReport:
     remote_files: list[RemoteFile] = []
     selected: list[RemoteFile] = []
     downloaded = 0
-    local_target = Path(args.repo_id)
+    local_target = None if is_s3 else Path(args.repo_id)
 
-    # What the RunReport records as the target; overridden below for a local target.
+    # What the RunReport records as the target, and where --mode download stages files;
+    # overridden below for a local or S3 target.
     report_repo_id, report_repo_type, report_revision = args.repo_id, args.repo_type, args.revision
+    repo_slug = args.repo_id.lstrip("/").replace("/", "__")
+    local_root = download_dir / f"{args.repo_type}__{repo_slug}"
 
     if args.offline:
         if not local_root.exists():
@@ -905,6 +915,36 @@ def run(args: argparse.Namespace) -> RunReport:
             selected.append(RemoteFile(path=p.relative_to(local_root).as_posix(), size=p.stat().st_size))
         log(f"Offline mode: inspecting {len(selected)} file(s) under {local_root}")
         mode = "download"
+    elif is_s3:
+        mode = args.mode
+        bucket, prefix = parse_s3_uri(args.repo_id)
+        report_repo_id, report_repo_type, report_revision = f"s3://{bucket}/{prefix}", "s3", None
+        repo_slug = f"{bucket}/{prefix}".rstrip("/").replace("/", "__")
+        local_root = download_dir / f"s3__{repo_slug}"
+        connector = S3Connector(
+            bucket, prefix, profile=args.aws_profile, region=args.aws_region,
+            endpoint_url=args.endpoint_url, log=log,
+        )
+        user = connector.connect()
+
+        remote_files = connector.list_files()
+        files_listed = len(remote_files)
+        log(f"s3://{bucket}/{prefix} contains {files_listed} file(s), "
+            f"{_human_size(sum(f.size or 0 for f in remote_files))} total")
+
+        selected, skipped = _select_and_prepare(connector, remote_files, args, log, label=report_repo_id)
+
+        if args.dry_run:
+            log("Dry run: not inspecting.")
+            return RunReport(
+                repo_id=report_repo_id, repo_type=report_repo_type, revision=report_revision,
+                resolved_sha=None, authenticated_as=user,
+                generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                mode=mode, download_dir=None, files_listed=files_listed,
+                files_selected=len(selected), files_downloaded=0, files_skipped=skipped,
+                total_bytes_selected=sum(f.size or 0 for f in selected),
+                files=[], totals=build_totals([]), run_cost_s=round(time.time() - t_start, 2),
+            )
     elif local_target.exists():
         mode = "local"
         report_repo_id, report_repo_type, report_revision = str(local_target), "local", None
@@ -1081,14 +1121,15 @@ def write_reports(run_report: RunReport, report_dir: Path, basename: str | None,
 def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
-        description="Profile MCAP, ROS bag, MAT and Parquet files in a Hugging Face repo or a local "
-                    "directory/file and write a report. "
+        description="Profile MCAP, ROS bag, MAT and Parquet files in a Hugging Face repo, an S3 bucket, "
+                    "or a local directory/file, and write a report. "
                     "Other commands: check, compare, requirements (run '<command> -h').",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument("--version", action="version", version=f"phys-ai-dataprofiler {__version__}")
-    p.add_argument("repo_id", help="Hub repo id (org/dataset-name), or a local directory or file path")
+    p.add_argument("repo_id", help="Hub repo id (org/dataset-name), an s3://bucket/prefix URI, "
+                                   "or a local directory or file path")
     p.add_argument("--token", help="Hugging Face access token (else HF_TOKEN env or cached login)")
     p.add_argument("--repo-type", default="dataset", choices=["dataset", "model", "space"])
     p.add_argument("--revision", help="Branch, tag or commit sha (default: main)")
@@ -1113,6 +1154,11 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
                            "(only read when a requirements file sets dataset.min_stream_overlap_pct)")
     mode.add_argument("--workers", type=int, default=16, help="Parallel range requests per file")
     mode.add_argument("--block-kb", type=int, default=64, help="Block size for cached range reads")
+
+    s3 = p.add_argument_group("s3 (for an s3://bucket/prefix target)")
+    s3.add_argument("--aws-profile", help="AWS named profile (else the default credential chain)")
+    s3.add_argument("--aws-region", help="AWS region (else boto3's default resolution)")
+    s3.add_argument("--endpoint-url", help="S3-compatible endpoint (MinIO, R2, on-prem, ...)")
 
     sel = p.add_argument_group("file selection")
     sel.add_argument("--ext", nargs="+", default=list(DEFAULT_EXTENSIONS),
