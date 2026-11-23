@@ -2,14 +2,15 @@
 
 [![tests](https://github.com/akrishni/phys-ai-dataprofiler/actions/workflows/tests.yml/badge.svg)](https://github.com/akrishni/phys-ai-dataprofiler/actions/workflows/tests.yml)
 
-Profile physical-AI and lab datasets on the Hugging Face Hub **without downloading them**, and check
-them against what your model needs.
+Profile physical-AI and lab datasets on the Hugging Face Hub, in an S3 bucket, or on local disk,
+**without downloading them**, and check them against what your model needs.
 
-It reads only the bytes that hold metadata (headers, indexes, footers) through HTTP range requests, and
-reports streams, message counts, rates, jitter, gaps, episodes, NaN counts, and problems such as
-truncated or unindexed recordings. LeRobot datasets are covered as a whole: state and actions from the
-Parquet tables, each camera from its MP4s. A requirements file turns that into a
-pass / fail / unknown verdict, and `compare` ranks candidate datasets side by side.
+It reads only the bytes that hold metadata (headers, indexes, footers) through byte-range requests
+(HTTP Range on the Hub, `GetObject` with a `Range` header on S3), and reports streams, message counts,
+rates, jitter, gaps, episodes, NaN counts, and problems such as truncated or unindexed recordings.
+LeRobot datasets are covered as a whole: state and actions from the Parquet tables, each camera from its
+MP4s. A requirements file turns that into a pass / fail / unknown verdict, and `compare` ranks candidate
+datasets side by side, whatever source each one comes from.
 
 | Format | What is read |
 |---|---|

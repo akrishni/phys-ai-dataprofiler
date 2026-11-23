@@ -6,8 +6,8 @@ authors:
   - family-names: Krishniyer
     given-names: Anand
     email: akrishniyer@gmail.com
-version: 0.6.0
-date-released: 2026-11-22
+version: 0.6.2
+date-released: 2026-11-23
 license: MIT
 repository-code: "https://github.com/akrishni/phys-ai-dataprofiler"
 url: "https://pypi.org/project/phys-ai-dataprofiler/"
@@ -18,6 +18,8 @@ keywords:
   - ROS bag
   - data quality
   - Hugging Face
+  - S3
 abstract: >
-  Profiles MCAP, ROS 1 and ROS 2 bags, MATLAB and Parquet datasets on the Hugging Face Hub through
-  HTTP range requests, without downloading them, and checks them against a YAML requirements file.
+  Profiles MCAP, ROS 1 and ROS 2 bags, MATLAB and Parquet datasets on the Hugging Face Hub, in an S3
+  bucket, or on local disk, through byte-range requests, without downloading them, and checks them
+  against a YAML requirements file.
