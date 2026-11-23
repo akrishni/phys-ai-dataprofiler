@@ -4,7 +4,7 @@ Subcommands next to the default `phys-ai-dataprofiler org/dataset` profile:
     phys-ai-dataprofiler check org/dataset -r req.yaml        profile + verdict; exit 0 pass, 1 fail, 4 unknown
     phys-ai-dataprofiler check --report run.json -r req.yaml  verdict from an existing report, no network
     phys-ai-dataprofiler compare a.json b.json -r req.yaml    rank saved reports against the same requirements
-    phys-ai-dataprofiler compare org/a org/b -r req.yaml      profile each repo, then rank
+    phys-ai-dataprofiler compare org/a org/b -r req.yaml      profile each target (Hub/S3/local), then rank
     phys-ai-dataprofiler requirements list                    built-in presets
     phys-ai-dataprofiler requirements show teleop-imitation   print a preset (start your own from it)
     phys-ai-dataprofiler requirements validate req.yaml       check a file without profiling anything
@@ -100,11 +100,13 @@ def cmd_compare(argv: list[str]) -> int:
 
     p = argparse.ArgumentParser(
         prog=f"{PROG} compare",
-        description="Rank datasets against the same requirements. Each target is a saved JSON run report "
-                    "or a Hub repo id (profiled now with the default settings plus any options after --).",
+        description="Rank datasets against the same requirements. Each target is a saved JSON run report, "
+                    "a Hub repo id, an s3://bucket/prefix URI, or a local path (profiled now with the "
+                    "default settings plus any options after --).",
         epilog="Example: compare lerobot/pusht org/other -r preset:teleop-imitation -- --max-files 20",
     )
-    p.add_argument("targets", nargs="+", help="report.json files and/or Hub repo ids (at least two)")
+    p.add_argument("targets", nargs="+", help="report.json files, Hub repo ids, s3:// URIs, and/or "
+                                               "local paths (at least two)")
     p.add_argument("--requirements", "-r", required=True, metavar="FILE|preset:NAME")
     p.add_argument("--output", "-o", help="Write the comparison here (.md or .json; default: "
                                           "reports/compare_<requirements>_<time>.md and .json)")

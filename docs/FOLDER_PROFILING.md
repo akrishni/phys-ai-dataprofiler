@@ -172,7 +172,7 @@ For each channel with > 1 message:
 ### Python
 
 ```python
-from tools.rich_inspector import RichInspector
+from phys_ai_dataprofiler.inspectors.rich import RichInspector
 
 inspector = RichInspector("data.mcap")
 profile = inspector.inspect()
@@ -192,7 +192,7 @@ for finding in profile.findings:
 
 ```python
 from pathlib import Path
-from tools.rich_inspector import RichInspector
+from phys_ai_dataprofiler.inspectors.rich import RichInspector
 import json
 
 profiles = []

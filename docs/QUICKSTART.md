@@ -52,7 +52,7 @@ python scripts/compare_inspectors.py samples/sample.mcap samples/sample_v5.mat
 ### MCAP Files
 
 ```python
-from tools.mcapfile_inspector import McapFileInspector
+from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector
 
 # Inspect a file
 inspector = McapFileInspector("data.mcap")
@@ -90,7 +90,7 @@ if result.is_matfile:
 ### 1. Quick File Validation
 ```python
 # Check if file is valid without parsing
-from tools.mcapfile_inspector import McapFileInspector
+from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector
 
 result = McapFileInspector("unknown.file").inspect()
 if result.is_mcap:

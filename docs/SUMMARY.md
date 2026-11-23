@@ -115,7 +115,7 @@ Inspector Class
 
 ### MCAP Inspection
 ```python
-from tools.mcapfile_inspector import McapFileInspector
+from phys_ai_dataprofiler.inspectors.mcap import McapFileInspector
 
 inspector = McapFileInspector("data.mcap")
 result = inspector.inspect()

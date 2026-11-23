@@ -145,9 +145,9 @@ worst recordings with each stream's span.
 
 `compare` evaluates each candidate against the same file and ranks them: fewer required failures first,
 then fewer unknowns, then more passes, then more hours. Ties keep the order you gave. A target is a saved
-JSON report or a Hub repo id, which is profiled with default settings plus any options after `--`. The
-output is a Markdown table with one column per dataset, plus a "why not pass" list per candidate, and a
-JSON file with every verdict.
+JSON report, a Hub repo id, an `s3://bucket/prefix` URI, or a local directory/file path, which is
+profiled with default settings plus any options after `--`. The output is a Markdown table with one
+column per dataset, plus a "why not pass" list per candidate, and a JSON file with every verdict.
 
 ## Presets
 

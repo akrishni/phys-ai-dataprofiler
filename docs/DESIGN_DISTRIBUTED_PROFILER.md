@@ -1,9 +1,13 @@
 # Zero-Copy Dataset Profiler for Physical-AI Datasets
 
 Design document. Status: draft v2, 2026-10-17 (v1 had a shared profile registry; removed on review).
+Updated 2026-11-23: the local filesystem and S3 connectors from Phase 4 below have shipped
+(`phys_ai_dataprofiler/connectors/localfs.py`, `connectors/s3.py`); the rest of this document is as
+originally drafted.
 Scope: MCAP, ROS 1 bag, ROS 2 bag (MCAP and SQLite storage), MATLAB MAT (v5/v7, v7.3), plus LeRobot v2/v3
 sidecars since that is the dominant Hub-native robotics format. Primary source: the Hugging Face Hub; the
-reader layer is generic over any HTTP(S)/S3/GCS endpoint that honours Range requests.
+reader layer is generic over any HTTP(S)/S3/local-file endpoint that honours byte-range reads, which is
+why the local filesystem and S3 connectors could reuse the same inspectors unchanged.
 
 ---
 
@@ -257,7 +261,7 @@ bandwidth or CPU. Chunk sampling caps per-file requests when files have tens of 
 | 1 | `bag1` and `bag2` (SQLite) adapters (done 2026-11-03, `remote/rosbag.py`); FileProfile schema and merge; local content-hash cache; dataset roll-up; process-pool fan-out with rate limiting. | ROS 1 walk prototype from this session. |
 | 2 | Requirements file, evaluator, verdict report (done 2026-11-03: `requirements.py`, `evaluate.py`, `compare.py`, `check`/`compare` commands, 4 presets; see `docs/REQUIREMENTS.md`); `--sample`. | Phase 1 schema. |
 | 3 | T2 sampling tier (payload decodes, NaN scan); `lerobot` adapter; quality rules engine. | Phase 1 schema. |
-| 4 | Local HTML report with charts; MAT v7.3 via h5py over RangeFile; S3/GCS endpoints. | |
+| 4 | MAT v7.3 via h5py over RangeFile (done); local filesystem connector (done 2026-11-22, `connectors/localfs.py`); S3 connector (done 2026-11-23, `connectors/s3.py`, `S3RangeFile`); S3-compatible endpoints (MinIO, R2, on-prem) via `--endpoint-url` (done). Local HTML report with charts and GCS endpoints remain open. | |
 | 5 (optional) | SSH fan-out to lab machines with the laptop as merge point. | Phase 1 idempotent workers. |
 
 ## 8. Risks and open questions
